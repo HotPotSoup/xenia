@@ -9,7 +9,7 @@
 
 #include "xenia/ui/spirv/spirv_disassembler.h"
 
-#include "third_party/spirv-tools/include/libspirv/libspirv.h"
+#include "third_party/spirv-tools/include/spirv-tools/libspirv.h"
 #include "xenia/base/logging.h"
 
 namespace xe {
@@ -53,7 +53,8 @@ void SpirvDisassembler::Result::AppendText(StringBuffer* target_buffer) const {
   }
 }
 
-SpirvDisassembler::SpirvDisassembler() : spv_context_(spvContextCreate()) {}
+SpirvDisassembler::SpirvDisassembler()
+    : spv_context_(spvContextCreate(SPV_ENV_VULKAN_1_0)) {}
 
 SpirvDisassembler::~SpirvDisassembler() { spvContextDestroy(spv_context_); }
 

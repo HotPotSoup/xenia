@@ -1232,6 +1232,25 @@ void HIRBuilder::StoreMmio(cpu::MMIORange* mmio_range, uint32_t address,
   i->set_src3(value);
 }
 
+Value* HIRBuilder::LoadOffset(Value* address, Value* offset, TypeName type,
+                              uint32_t load_flags) {
+  ASSERT_ADDRESS_TYPE(address);
+  Instr* i = AppendInstr(OPCODE_LOAD_OFFSET_info, load_flags, AllocValue(type));
+  i->set_src1(address);
+  i->set_src2(offset);
+  i->src3.value = NULL;
+  return i->dest;
+}
+
+void HIRBuilder::StoreOffset(Value* address, Value* offset, Value* value,
+                             uint32_t store_flags) {
+  ASSERT_ADDRESS_TYPE(address);
+  Instr* i = AppendInstr(OPCODE_STORE_OFFSET_info, store_flags);
+  i->set_src1(address);
+  i->set_src2(offset);
+  i->set_src3(value);
+}
+
 Value* HIRBuilder::Load(Value* address, TypeName type, uint32_t load_flags) {
   ASSERT_ADDRESS_TYPE(address);
   Instr* i = AppendInstr(OPCODE_LOAD_info, load_flags, AllocValue(type));
@@ -1268,6 +1287,12 @@ void HIRBuilder::Prefetch(Value* address, size_t length,
 }
 
 void HIRBuilder::MemoryBarrier() { AppendInstr(OPCODE_MEMORY_BARRIER_info, 0); }
+
+void HIRBuilder::SetRoundingMode(Value* value) {
+  ASSERT_INTEGER_TYPE(value);
+  Instr* i = AppendInstr(OPCODE_SET_ROUNDING_MODE_info, 0);
+  i->set_src1(value);
+}
 
 Value* HIRBuilder::Max(Value* value1, Value* value2) {
   ASSERT_TYPES_EQUAL(value1, value2);
@@ -1357,6 +1382,13 @@ Value* HIRBuilder::IsFalse(Value* value) {
   }
 
   Instr* i = AppendInstr(OPCODE_IS_FALSE_info, 0, AllocValue(INT8_TYPE));
+  i->set_src1(value);
+  i->src2.value = i->src3.value = NULL;
+  return i->dest;
+}
+
+Value* HIRBuilder::IsNan(Value* value) {
+  Instr* i = AppendInstr(OPCODE_IS_NAN_info, 0, AllocValue(INT8_TYPE));
   i->set_src1(value);
   i->src2.value = i->src3.value = NULL;
   return i->dest;
@@ -1659,6 +1691,15 @@ Value* HIRBuilder::RSqrt(Value* value) {
   return i->dest;
 }
 
+Value* HIRBuilder::Recip(Value* value) {
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
+
+  Instr* i = AppendInstr(OPCODE_RECIP_info, 0, AllocValue(value->type));
+  i->set_src1(value);
+  i->src2.value = i->src3.value = NULL;
+  return i->dest;
+}
+
 Value* HIRBuilder::Pow2(Value* value) {
   ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
@@ -1941,7 +1982,10 @@ Value* HIRBuilder::CountLeadingZeros(Value* value) {
 
   if (value->IsConstantZero()) {
     static const uint8_t zeros[] = {
-        8, 16, 32, 64,
+        8,
+        16,
+        32,
+        64,
     };
     assert_true(value->type <= INT64_TYPE);
     return LoadConstantUint8(zeros[value->type]);

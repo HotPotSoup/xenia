@@ -10,6 +10,7 @@
 #include "xenia/emulator.h"
 
 #include <gflags/gflags.h>
+#include <cinttypes>
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
@@ -22,13 +23,18 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/backend/x64/x64_backend.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/util/gameinfo_utils.h"
 #include "xenia/kernel/util/xdbf_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
+#include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/memory.h"
 #include "xenia/ui/imgui_dialog.h"
@@ -103,10 +109,26 @@ X_STATUS Emulator::Setup(
   // Shared export resolver used to attach and query for HLE exports.
   export_resolver_ = std::make_unique<xe::cpu::ExportResolver>();
 
+  std::unique_ptr<xe::cpu::backend::Backend> backend;
+  if (!backend) {
+#if defined(XENIA_HAS_X64_BACKEND) && XENIA_HAS_X64_BACKEND
+    if (FLAGS_cpu == "x64") {
+      backend.reset(new xe::cpu::backend::x64::X64Backend());
+    }
+#endif  // XENIA_HAS_X64_BACKEND
+    if (FLAGS_cpu == "any") {
+#if defined(XENIA_HAS_X64_BACKEND) && XENIA_HAS_X64_BACKEND
+      if (!backend) {
+        backend.reset(new xe::cpu::backend::x64::X64Backend());
+      }
+#endif  // XENIA_HAS_X64_BACKEND
+    }
+  }
+
   // Initialize the CPU.
   processor_ = std::make_unique<xe::cpu::Processor>(memory_.get(),
                                                     export_resolver_.get());
-  if (!processor_->Setup()) {
+  if (!processor_->Setup(std::move(backend))) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -164,21 +186,34 @@ X_STATUS Emulator::Setup(
   // HLE kernel modules.
   kernel_state_->LoadKernelModule<kernel::xboxkrnl::XboxkrnlModule>();
   kernel_state_->LoadKernelModule<kernel::xam::XamModule>();
+  kernel_state_->LoadKernelModule<kernel::xbdm::XbdmModule>();
 
   // Initialize emulator fallback exception handling last.
   ExceptionHandler::Install(Emulator::ExceptionCallbackThunk, this);
 
-  // Finish initializing the display.
-  display_window_->loop()->PostSynchronous([this]() {
-    xe::ui::GraphicsContextLock context_lock(display_window_->context());
-    Profiler::set_window(display_window_);
-  });
+  if (display_window_) {
+    // Finish initializing the display.
+    display_window_->loop()->PostSynchronous([this]() {
+      xe::ui::GraphicsContextLock context_lock(display_window_->context());
+      Profiler::set_window(display_window_);
+    });
+  }
 
   return result;
 }
 
-X_STATUS Emulator::LaunchPath(std::wstring path,
-                              std::function<void()> on_launch) {
+X_STATUS Emulator::TerminateTitle() {
+  if (!is_title_open()) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  kernel_state_->TerminateTitle();
+  title_id_ = 0;
+  game_title_ = L"";
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS Emulator::LaunchPath(std::wstring path) {
   // Launch based on file type.
   // This is a silly guess based on file extension.
   auto last_slash = path.find_last_of(xe::kPathSeparator);
@@ -188,19 +223,18 @@ X_STATUS Emulator::LaunchPath(std::wstring path,
   }
   if (last_dot == std::wstring::npos) {
     // Likely an STFS container.
-    return LaunchStfsContainer(path, on_launch);
+    return LaunchStfsContainer(path);
   } else if (path.substr(last_dot) == L".xex" ||
              path.substr(last_dot) == L".elf") {
     // Treat as a naked xex file.
-    return LaunchXexFile(path, on_launch);
+    return LaunchXexFile(path);
   } else {
     // Assume a disc image.
-    return LaunchDiscImage(path, on_launch);
+    return LaunchDiscImage(path);
   }
 }
 
-X_STATUS Emulator::LaunchXexFile(std::wstring path,
-                                 std::function<void()> on_launch) {
+X_STATUS Emulator::LaunchXexFile(std::wstring path) {
   // We create a virtual filesystem pointing to its directory and symlink
   // that to the game filesystem.
   // e.g., /my/files/foo.xex will get a local fs at:
@@ -232,11 +266,10 @@ X_STATUS Emulator::LaunchXexFile(std::wstring path,
 
   // Launch the game.
   std::string fs_path = "game:\\" + xe::to_string(file_name);
-  return CompleteLaunch(path, fs_path, on_launch);
+  return CompleteLaunch(path, fs_path);
 }
 
-X_STATUS Emulator::LaunchDiscImage(std::wstring path,
-                                   std::function<void()> on_launch) {
+X_STATUS Emulator::LaunchDiscImage(std::wstring path) {
   auto mount_path = "\\Device\\Cdrom0";
 
   // Register the disc image in the virtual filesystem.
@@ -255,11 +288,11 @@ X_STATUS Emulator::LaunchDiscImage(std::wstring path,
   file_system_->RegisterSymbolicLink("d:", mount_path);
 
   // Launch the game.
-  return CompleteLaunch(path, "game:\\default.xex", on_launch);
+  auto module_path(FindLaunchModule());
+  return CompleteLaunch(path, module_path);
 }
 
-X_STATUS Emulator::LaunchStfsContainer(std::wstring path,
-                                       std::function<void()> on_launch) {
+X_STATUS Emulator::LaunchStfsContainer(std::wstring path) {
   auto mount_path = "\\Device\\Cdrom0";
 
   // Register the container in the virtual filesystem.
@@ -278,7 +311,8 @@ X_STATUS Emulator::LaunchStfsContainer(std::wstring path,
   file_system_->RegisterSymbolicLink("d:", mount_path);
 
   // Launch the game.
-  return CompleteLaunch(path, "game:\\default.xex", on_launch);
+  auto module_path(FindLaunchModule());
+  return CompleteLaunch(path, module_path);
 }
 
 void Emulator::Pause() {
@@ -295,13 +329,18 @@ void Emulator::Pause() {
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
           kernel::XObject::kTypeThread);
+  auto current_thread = kernel::XThread::IsInThread()
+                            ? kernel::XThread::GetCurrentThread()
+                            : nullptr;
   for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
+    // Don't pause ourself or host threads.
+    if (thread == current_thread || !thread->can_debugger_suspend()) {
       continue;
     }
 
-    thread->thread()->Suspend(nullptr);
+    if (thread->is_running()) {
+      thread->thread()->Suspend(nullptr);
+    }
   }
 
   XELOGD("! EMULATOR PAUSED !");
@@ -326,7 +365,9 @@ void Emulator::Resume() {
       continue;
     }
 
-    thread->thread()->Resume(nullptr);
+    if (thread->is_running()) {
+      thread->thread()->Resume(nullptr);
+    }
   }
 }
 
@@ -335,7 +376,7 @@ bool Emulator::SaveToFile(const std::wstring& path) {
 
   filesystem::CreateFile(path);
   auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite, 0,
-                                1024ull * 1024ull * 1024ull * 4ull);
+                                1024ull * 1024ull * 1024ull * 2ull);
   if (!map) {
     return false;
   }
@@ -343,6 +384,7 @@ bool Emulator::SaveToFile(const std::wstring& path) {
   // Save the emulator state to a file
   ByteStream stream(map->data(), map->size());
   stream.Write('XSAV');
+  stream.Write(title_id_);
 
   // It's important we don't hold the global lock here! XThreads need to step
   // forward (possibly through guarded regions) without worry!
@@ -373,6 +415,13 @@ bool Emulator::RestoreFromFile(const std::wstring& path) {
   auto lock = global_critical_region::AcquireDirect();
   ByteStream stream(map->data(), map->size());
   if (stream.Read<uint32_t>() != 'XSAV') {
+    return false;
+  }
+
+  auto title_id = stream.Read<uint32_t>();
+  if (title_id != title_id_) {
+    // Swapping between titles is unsupported at the moment.
+    assert_always();
     return false;
   }
 
@@ -415,6 +464,18 @@ bool Emulator::RestoreFromFile(const std::wstring& path) {
   return true;
 }
 
+bool Emulator::TitleRequested() {
+  auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  return xam->loader_data().launch_data_present;
+}
+
+void Emulator::LaunchNextTitle() {
+  auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  auto next_title = xam->loader_data().launch_path;
+
+  CompleteLaunch(L"", next_title);
+}
+
 bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
   return reinterpret_cast<Emulator*>(data)->ExceptionCallback(ex);
 }
@@ -440,33 +501,49 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     return false;
   }
 
-  auto global_lock = global_critical_region::AcquireDirect();
-
   // Within range. Pause the emulator and eat the exception.
-  auto threads =
-      kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::kTypeThread);
+  Pause();
+
+  // Dump information into the log.
   auto current_thread = kernel::XThread::GetCurrentThread();
-  for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
-      continue;
-    }
-    if (current_thread == thread.get()) {
-      continue;
-    }
-    thread->Suspend(nullptr);
+  assert_not_null(current_thread);
+
+  auto guest_function = code_cache->LookupFunction(ex->pc());
+  assert_not_null(guest_function);
+
+  auto context = current_thread->thread_state()->context();
+
+  XELOGE("==== CRASH DUMP ====");
+  XELOGE("Thread ID (Host: 0x%.8X / Guest: 0x%.8X)",
+         current_thread->thread()->system_id(), current_thread->thread_id());
+  XELOGE("Thread Handle: 0x%.8X", current_thread->handle());
+  XELOGE("PC: 0x%.8X", guest_function->MapMachineCodeToGuestAddress(ex->pc()));
+  XELOGE("Registers:");
+  for (int i = 0; i < 32; i++) {
+    XELOGE(" r%-3d = 0x%.16" PRIX64, i, context->r[i]);
+  }
+
+  for (int i = 0; i < 32; i++) {
+    XELOGE(" f%-3d = 0x%.16" PRIX64 " = (double)%f = (float)%f", i,
+           context->f[i], context->f[i], *(float*)&context->f[i]);
+  }
+
+  for (int i = 0; i < 128; i++) {
+    XELOGE(" v%-3d = [0x%.8X, 0x%.8X, 0x%.8X, 0x%.8X]", i, context->v[i].i32[0],
+           context->v[i].i32[1], context->v[i].i32[2], context->v[i].i32[3]);
   }
 
   // Display a dialog telling the user the guest has crashed.
   display_window()->loop()->PostSynchronous([&]() {
-    xe::ui::ImGuiDialog::ShowMessageBox(display_window(), "Uh-oh!",
-                                        "The guest has crashed.\n\n"
-                                        "Xenia has now paused itself.");
+    xe::ui::ImGuiDialog::ShowMessageBox(
+        display_window(), "Uh-oh!",
+        "The guest has crashed.\n\n"
+        ""
+        "Xenia has now paused itself.\n"
+        "A crash dump has been written into the log.");
   });
 
   // Now suspend ourself (we should be a guest thread).
-  assert_true(current_thread->can_debugger_suspend());
   current_thread->Suspend(nullptr);
 
   // We should not arrive here!
@@ -485,68 +562,91 @@ void Emulator::WaitUntilExit() {
       break;
     }
   }
+
+  on_exit();
 }
 
-X_STATUS Emulator::CompleteLaunch(const std::wstring& path,
-                                  const std::string& module_path,
-                                  std::function<void()> on_launch) {
-  // Allow xam to request module loads.
-  auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+std::string Emulator::FindLaunchModule() {
+  std::string path("game:\\");
+  std::string default_module("default.xex");
 
-  X_STATUS result = X_STATUS_SUCCESS;
-  auto next_module = module_path;
-  while (next_module != "") {
-    XELOGI("Launching module %s", next_module.c_str());
-    auto module = kernel_state_->LoadUserModule(next_module.c_str());
-    if (!module) {
-      XELOGE("Failed to load user module %S", path.c_str());
-      return X_STATUS_NOT_FOUND;
-    }
+  auto gameinfo_entry(file_system_->ResolvePath(path + "GameInfo.bin"));
+  if (gameinfo_entry) {
+    vfs::File* file = nullptr;
+    X_STATUS result =
+        gameinfo_entry->Open(vfs::FileAccess::kGenericRead, &file);
+    if (XSUCCEEDED(result)) {
+      std::vector<uint8_t> buffer(gameinfo_entry->size());
+      size_t bytes_read = 0;
+      result = file->ReadSync(buffer.data(), buffer.size(), 0, &bytes_read);
+      if (XSUCCEEDED(result)) {
+        kernel::util::GameInfo info(buffer);
+        if (info.is_valid()) {
+          XELOGI("Found virtual title %s", info.virtual_title_id().c_str());
 
-    kernel_state_->SetExecutableModule(module);
-
-    // Try and load the resource database (xex only).
-    if (module->title_id()) {
-      char title_id[9] = {0};
-      std::sprintf(title_id, "%08X", module->title_id());
-      uint32_t resource_data = 0;
-      uint32_t resource_size = 0;
-      if (XSUCCEEDED(
-              module->GetSection(title_id, &resource_data, &resource_size))) {
-        kernel::util::XdbfGameData db(
-            module->memory()->TranslateVirtual(resource_data), resource_size);
-        if (db.is_valid()) {
-          game_title_ = xe::to_wstring(db.title());
-          auto icon_block = db.icon();
-          if (icon_block) {
-            display_window_->SetIcon(icon_block.buffer, icon_block.size);
+          const std::string xna_id("584E07D1");
+          auto xna_id_entry(file_system_->ResolvePath(path + xna_id));
+          if (xna_id_entry) {
+            default_module = xna_id + "\\" + info.module_name();
+          } else {
+            XELOGE("Could not find fixed XNA path %s", xna_id.c_str());
           }
         }
       }
     }
-
-    auto main_xthread = module->Launch();
-    if (!main_xthread) {
-      return X_STATUS_UNSUCCESSFUL;
-    }
-
-    on_launch();
-    main_thread_ = main_xthread->thread();
-    WaitUntilExit();
-
-    // Check xam and see if they want us to load another module.
-    auto& loader_data = xam->loader_data();
-    next_module = loader_data.launch_path;
-
-    // And blank out the launch path to avoid an infinite loop.
-    loader_data.launch_path = "";
   }
 
-  if (result == 0) {
-    return X_STATUS_SUCCESS;
-  } else {
+  return path + default_module;
+}
+
+X_STATUS Emulator::CompleteLaunch(const std::wstring& path,
+                                  const std::string& module_path) {
+  // Allow xam to request module loads.
+  auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+
+  XELOGI("Launching module %s", module_path.c_str());
+  auto module = kernel_state_->LoadUserModule(module_path.c_str());
+  if (!module) {
+    XELOGE("Failed to load user module %S", path.c_str());
+    return X_STATUS_NOT_FOUND;
+  }
+
+  // Grab the current title ID.
+  xex2_opt_execution_info* info = nullptr;
+  module->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &info);
+  if (info) {
+    title_id_ = info->title_id;
+  }
+
+  // Try and load the resource database (xex only).
+  if (module->title_id()) {
+    char title_id[9] = {0};
+    std::snprintf(title_id, xe::countof(title_id), "%08X", module->title_id());
+    uint32_t resource_data = 0;
+    uint32_t resource_size = 0;
+    if (XSUCCEEDED(
+            module->GetSection(title_id, &resource_data, &resource_size))) {
+      kernel::util::XdbfGameData db(
+          module->memory()->TranslateVirtual(resource_data), resource_size);
+      if (db.is_valid()) {
+        game_title_ = xe::to_wstring(db.title());
+        auto icon_block = db.icon();
+        if (icon_block) {
+          display_window_->SetIcon(icon_block.buffer, icon_block.size);
+        }
+      }
+    }
+  }
+
+  auto main_xthread = kernel_state_->LaunchModule(module);
+  if (!main_xthread) {
     return X_STATUS_UNSUCCESSFUL;
   }
+
+  main_thread_ = main_xthread->thread();
+  on_launch();
+
+  return X_STATUS_SUCCESS;
 }
 
 }  // namespace xe

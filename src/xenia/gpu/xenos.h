@@ -12,21 +12,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
-
-#if XE_COMPILER_MSVC
-#define XEPACKEDSTRUCT(name, value)                                  \
-  __pragma(pack(push, 1)) struct name##_s value __pragma(pack(pop)); \
-  typedef struct name##_s name;
-#define XEPACKEDSTRUCTANONYMOUS(value) \
-  __pragma(pack(push, 1)) struct value __pragma(pack(pop));
-#define XEPACKEDUNION(name, value)                                  \
-  __pragma(pack(push, 1)) union name##_s value __pragma(pack(pop)); \
-  typedef union name##_s name;
-#else
-#define XEPACKEDSTRUCT(name, value) struct __attribute__((packed)) name value;
-#define XEPACKEDSTRUCTANONYMOUS(value) struct __attribute__((packed)) value;
-#define XEPACKEDUNION(name, value) union __attribute__((packed)) name value;
-#endif  // XE_PLATFORM_WIN32
+#include "xenia/base/platform.h"
 
 namespace xe {
 namespace gpu {
@@ -44,11 +30,19 @@ enum class PrimitiveType : uint32_t {
   kTriangleList = 0x04,
   kTriangleFan = 0x05,
   kTriangleStrip = 0x06,
-  kUnknown0x07 = 0x07,
+  kTriangleWithWFlags = 0x07,
   kRectangleList = 0x08,
   kLineLoop = 0x0C,
   kQuadList = 0x0D,
   kQuadStrip = 0x0E,
+  kPolygon = 0x0F,
+  k2DCopyRectListV0 = 0x10,
+  k2DCopyRectListV1 = 0x11,
+  k2DCopyRectListV2 = 0x12,
+  k2DCopyRectListV3 = 0x13,
+  k2DFillRectList = 0x14,
+  k2DLineStrip = 0x15,
+  k2DTriStrip = 0x16,
 };
 
 enum class Dimension : uint32_t {
@@ -84,6 +78,13 @@ enum class AnisoFilter : uint32_t {
   kMax_8_1 = 4,
   kMax_16_1 = 5,
   kUseFetchConst = 7,
+};
+
+enum class BorderColor : uint32_t {
+  k_AGBR_Black = 0,
+  k_AGBR_White = 1,
+  k_ACBYCR_BLACK = 2,
+  k_ACBCRY_BLACK = 3,
 };
 
 enum class TextureDimension : uint32_t {
@@ -366,7 +367,7 @@ typedef union {
     uint32_t vs_resource : 1;
     uint32_t ps_resource : 1;
     uint32_t param_gen : 1;
-    uint32_t unknown0 : 1;
+    uint32_t gen_index_pix : 1;
     uint32_t vs_export_count : 4;
     uint32_t vs_export_mode : 3;
     uint32_t ps_export_depth : 1;
@@ -379,11 +380,12 @@ typedef union {
 // XE_GPU_REG_SHADER_CONSTANT_FETCH_*
 XEPACKEDUNION(xe_gpu_vertex_fetch_t, {
   XEPACKEDSTRUCTANONYMOUS({
-    uint32_t type : 2;
-    uint32_t address : 30;
-    uint32_t endian : 2;
-    uint32_t size : 24;
-    uint32_t unk1 : 6;
+    uint32_t type : 2;      // +0
+    uint32_t address : 30;  // +2
+
+    uint32_t endian : 2;  // +0
+    uint32_t size : 24;   // +2 size in words
+    uint32_t unk1 : 6;    // +26
   });
   XEPACKEDSTRUCTANONYMOUS({
     uint32_t dword_0;
@@ -394,21 +396,25 @@ XEPACKEDUNION(xe_gpu_vertex_fetch_t, {
 // XE_GPU_REG_SHADER_CONSTANT_FETCH_*
 XEPACKEDUNION(xe_gpu_texture_fetch_t, {
   XEPACKEDSTRUCTANONYMOUS({
-    uint32_t type : 2;  // dword_0
-    uint32_t sign_x : 2;
-    uint32_t sign_y : 2;
-    uint32_t sign_z : 2;
-    uint32_t sign_w : 2;
-    uint32_t clamp_x : 3;
-    uint32_t clamp_y : 3;
-    uint32_t clamp_z : 3;
-    uint32_t unk0 : 3;
-    uint32_t pitch : 9;
-    uint32_t tiled : 1;
-    uint32_t format : 6;  // dword_1
-    uint32_t endianness : 2;
-    uint32_t unk1 : 4;
-    uint32_t address : 20;
+    uint32_t type : 2;      // +0 dword_0
+    uint32_t sign_x : 2;    // +2
+    uint32_t sign_y : 2;    // +4
+    uint32_t sign_z : 2;    // +6
+    uint32_t sign_w : 2;    // +8
+    uint32_t clamp_x : 3;   // +10
+    uint32_t clamp_y : 3;   // +13
+    uint32_t clamp_z : 3;   // +16
+    uint32_t unused_0 : 3;  // +19
+    uint32_t pitch : 9;     // +22 byte_pitch >> 5
+    uint32_t tiled : 1;     // +31
+
+    uint32_t format : 6;        // +0 dword_1
+    uint32_t endianness : 2;    // +6
+    uint32_t request_size : 2;  // +8
+    uint32_t stacked : 1;       // +10
+    uint32_t clamp_policy : 1;  // +11 d3d/opengl
+    uint32_t address : 20;      // +12
+
     union {  // dword_2
       struct {
         uint32_t width : 24;
@@ -430,22 +436,34 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
         uint32_t depth : 10;
       } size_3d;
     };
-    uint32_t unk3_0 : 1;    // dword_3
-    uint32_t swizzle : 12;  // xyzw, 3b each (XE_GPU_SWIZZLE)
-    uint32_t unk3_1 : 6;
-    uint32_t mag_filter : 2;
-    uint32_t min_filter : 2;
-    uint32_t mip_filter : 2;
-    uint32_t aniso_filter : 3;
-    uint32_t unk3_2 : 3;
-    uint32_t border : 1;
-    uint32_t unk4_0 : 2;  // dword_4
-    uint32_t mip_min_level : 4;
-    uint32_t mip_max_level : 4;
-    uint32_t unk4_1 : 22;
-    uint32_t unk5 : 9;  // dword_5
-    uint32_t dimension : 2;
-    uint32_t unk5b : 21;
+
+    uint32_t num_format : 1;    // +0 dword_3 frac/int
+    uint32_t swizzle : 12;      // +1 xyzw, 3b each (XE_GPU_SWIZZLE)
+    int32_t exp_adjust : 6;     // +13
+    uint32_t mag_filter : 2;    // +19
+    uint32_t min_filter : 2;    // +21
+    uint32_t mip_filter : 2;    // +23
+    uint32_t aniso_filter : 3;  // +25
+    uint32_t unused_3 : 3;      // +28
+    uint32_t border_size : 1;   // +31
+
+    uint32_t vol_mag_filter : 1;    // +0 dword_4
+    uint32_t vol_min_filter : 1;    // +1
+    uint32_t mip_min_level : 4;     // +2
+    uint32_t mip_max_level : 4;     // +6
+    uint32_t mag_aniso_walk : 1;    // +10
+    uint32_t min_aniso_walk : 1;    // +11
+    int32_t lod_bias : 10;          // +12
+    int32_t grad_exp_adjust_h : 5;  // +22
+    int32_t grad_exp_adjust_v : 5;  // +27
+
+    uint32_t border_color : 2;   // +0 dword_5
+    uint32_t force_bcw_max : 1;  // +2
+    uint32_t tri_clamp : 2;      // +3
+    int32_t aniso_bias : 4;      // +5
+    uint32_t dimension : 2;      // +9
+    uint32_t packed_mips : 1;    // +11
+    uint32_t mip_address : 20;   // +12
   });
   XEPACKEDSTRUCTANONYMOUS({
     uint32_t dword_0;
@@ -486,6 +504,34 @@ XEPACKEDUNION(xe_gpu_fetch_group_t, {
   });
 });
 
+// Enum of event values used for VGT_EVENT_INITIATOR
+enum Event {
+  VS_DEALLOC = 0,
+  PS_DEALLOC = 1,
+  VS_DONE_TS = 2,
+  PS_DONE_TS = 3,
+  CACHE_FLUSH_TS = 4,
+  CONTEXT_DONE = 5,
+  CACHE_FLUSH = 6,
+  VIZQUERY_START = 7,
+  VIZQUERY_END = 8,
+  SC_WAIT_WC = 9,
+  MPASS_PS_CP_REFETCH = 10,
+  MPASS_PS_RST_START = 11,
+  MPASS_PS_INCR_START = 12,
+  RST_PIX_CNT = 13,
+  RST_VTX_CNT = 14,
+  TILE_FLUSH = 15,
+  CACHE_FLUSH_AND_INV_TS_EVENT = 20,
+  ZPASS_DONE = 21,
+  CACHE_FLUSH_AND_INV_EVENT = 22,
+  PERFCOUNTER_START = 23,
+  PERFCOUNTER_STOP = 24,
+  SCREEN_EXT_INIT = 25,
+  SCREEN_EXT_RPT = 26,
+  VS_FETCH_DONE_TS = 27,
+};
+
 // Opcodes (IT_OPCODE) for Type-3 commands in the ringbuffer.
 // https://github.com/freedreno/amd-gpu/blob/master/include/api/gsl_pm4types.h
 // Not sure if all of these are used.
@@ -501,7 +547,7 @@ enum Type3Opcode {
   PM4_WAIT_FOR_IDLE         = 0x26,   // wait for the IDLE state of the engine
   PM4_WAIT_REG_MEM          = 0x3c,   // wait until a register or memory location is a specific value
   PM4_WAIT_REG_EQ           = 0x52,   // wait until a register location is equal to a specific value
-  PM4_WAT_REG_GTE           = 0x53,   // wait until a register location is >= a specific value
+  PM4_WAIT_REG_GTE          = 0x53,   // wait until a register location is >= a specific value
   PM4_WAIT_UNTIL_READ       = 0x5c,   // wait until a read completes
   PM4_WAIT_IB_PFD_COMPLETE  = 0x5d,   // wait until all base/size writes from an IB_PFD packet have completed
 
@@ -526,9 +572,9 @@ enum Type3Opcode {
   PM4_VIZ_QUERY             = 0x23,   // begin/end initiator for viz query extent processing
   PM4_SET_STATE             = 0x25,   // fetch state sub-blocks and initiate shader code DMAs
   PM4_SET_CONSTANT          = 0x2d,   // load constant into chip and to memory
-  PM4_SET_CONSTANT2         = 0x55,
+  PM4_SET_CONSTANT2         = 0x55,   // INCR_UPDATE_STATE
+  PM4_SET_SHADER_CONSTANTS  = 0x56,   // INCR_UPDT_CONST
   PM4_LOAD_ALU_CONSTANT     = 0x2f,   // load constants from memory
-  PM4_SET_SHADER_CONSTANTS  = 0x56,   // ?? constant values
   PM4_IM_LOAD               = 0x27,   // load sequencer instruction memory (pointer-based)
   PM4_IM_LOAD_IMMEDIATE     = 0x2b,   // load sequencer instruction memory (code embedded in packet)
   PM4_LOAD_CONSTANT_CONTEXT = 0x2e,   // load constants from a location in memory
@@ -555,20 +601,18 @@ enum Type3Opcode {
 };
 // clang-format on
 
-template <uint16_t index, uint16_t count, bool one_reg = false>
-constexpr inline uint32_t MakePacketType0() {
+inline uint32_t MakePacketType0(uint16_t index, uint16_t count,
+                                bool one_reg = false) {
   // ttcccccc cccccccc oiiiiiii iiiiiiii
-  static_assert(index <= 0x7FFF, "index must be <= 0x7FFF");
-  static_assert(count >= 1 && count <= 0x4000,
-                "count must be >= 1 and <= 0x4000");
+  assert(index <= 0x7FFF);
+  assert(count >= 1 && count <= 0x4000);
   return (0u << 30) | (((count - 1) & 0x3FFF) << 16) | (index & 0x7FFF);
 }
 
-template <uint16_t index_1, uint16_t index_2>
-constexpr inline uint32_t MakePacketType1() {
+inline uint32_t MakePacketType1(uint16_t index_1, uint16_t index_2) {
   // tt?????? ??222222 22222111 11111111
-  static_assert(index_1 <= 0x7FF, "index_1 must be <= 0x7FF");
-  static_assert(index_2 <= 0x7FF, "index_2 must be <= 0x7FF");
+  assert(index_1 <= 0x7FF);
+  assert(index_2 <= 0x7FF);
   return (1u << 30) | ((index_2 & 0x7FF) << 11) | (index_1 & 0x7FF);
 }
 
@@ -577,12 +621,11 @@ constexpr inline uint32_t MakePacketType2() {
   return (2u << 30);
 }
 
-template <Type3Opcode opcode, uint16_t count, bool predicate = false>
-constexpr inline uint32_t MakePacketType3() {
+inline uint32_t MakePacketType3(Type3Opcode opcode, uint16_t count,
+                                bool predicate = false) {
   // ttcccccc cccccccc ?ooooooo ???????p
-  static_assert(opcode <= 0x7F, "opcode must be <= 0x7F");
-  static_assert(count >= 1 && count <= 0x4000,
-                "count must be >= 1 and <= 0x4000");
+  assert(opcode <= 0x7F);
+  assert(count >= 1 && count <= 0x4000);
   return (3u << 30) | (((count - 1) & 0x3FFF) << 16) | ((opcode & 0x7F) << 8) |
          (predicate ? 1 : 0);
 }

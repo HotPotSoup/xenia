@@ -12,6 +12,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -73,7 +74,7 @@ struct X_DISPLAY_INFO {
   xe::be<uint16_t> front_buffer_height;              // 0x2
   xe::be<uint8_t> front_buffer_color_format;         // 0x4
   xe::be<uint8_t> front_buffer_pixel_format;         // 0x5
-  X_D3DPRIVATE_SCALER_PARAMETERS scaler_parameters;  // 0x6
+  X_D3DPRIVATE_SCALER_PARAMETERS scaler_parameters;  // 0x8
   xe::be<uint16_t> display_window_overscan_left;     // 0x40
   xe::be<uint16_t> display_window_overscan_top;      // 0x42
   xe::be<uint16_t> display_window_overscan_right;    // 0x44
@@ -159,12 +160,13 @@ DECLARE_XBOXKRNL_EXPORT(VdSetDisplayModeOverride,
                         ExportTag::kVideo | ExportTag::kStub);
 
 dword_result_t VdInitializeEngines(unknown_t unk0, function_t callback,
-                                   unknown_t unk1, lpunknown_t unk2_ptr,
-                                   lpunknown_t unk3_ptr) {
+                                   lpvoid_t arg, lpdword_t pfp_ptr,
+                                   lpdword_t me_ptr) {
   // r3 = 0x4F810000
   // r4 = function ptr (cleanup callback?)
-  // r5 = 0
-  // r6/r7 = some binary data in .data
+  // r5 = function arg
+  // r6 = PFP Microcode
+  // r7 = ME Microcode
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT(VdInitializeEngines,
@@ -200,15 +202,12 @@ void VdSetGraphicsInterruptCallback(function_t callback, lpvoid_t user_data) {
 }
 DECLARE_XBOXKRNL_EXPORT(VdSetGraphicsInterruptCallback, ExportTag::kVideo);
 
-void VdInitializeRingBuffer(lpvoid_t ptr, int_t page_count) {
+void VdInitializeRingBuffer(lpvoid_t ptr, int_t log2_size) {
   // r3 = result of MmGetPhysicalAddress
-  // r4 = number of pages? page size?
-  //      0x8000 -> cntlzw=16 -> 0x1C - 16 = 12
+  // r4 = log2(size)
   // Buffer pointers are from MmAllocatePhysicalMemory with WRITE_COMBINE.
-  // Sizes could be zero? XBLA games seem to do this. Default sizes?
-  // D3D does size / region_count - must be > 1024
   auto graphics_system = kernel_state()->emulator()->graphics_system();
-  graphics_system->InitializeRingBuffer(ptr, page_count);
+  graphics_system->InitializeRingBuffer(ptr, log2_size);
 }
 DECLARE_XBOXKRNL_EXPORT(VdInitializeRingBuffer, ExportTag::kVideo);
 
@@ -239,36 +238,31 @@ DECLARE_XBOXKRNL_EXPORT(VdSetSystemCommandBufferGpuIdentifierAddress,
 // no op?
 
 dword_result_t VdInitializeScalerCommandBuffer(
-    unknown_t unk0,    // 0?
-    unknown_t unk1,    // 0x050002d0 size of ?
-    unknown_t unk2,    // 0?
-    unknown_t unk3,    // 0x050002d0 size of ?
-    unknown_t unk4,    // 0x050002d0 size of ?
-    unknown_t unk5,    // 7?
-    lpunknown_t unk6,  // 0x2004909c <-- points to zeros?
-    unknown_t unk7,    // 7?
-    lpvoid_t dest_ptr  // Points to the first 80000000h where the memcpy
-                       // sources from.
-    ) {
+    dword_t scaler_source_xy,      // ((uint16_t)y << 16) | (uint16_t)x
+    dword_t scaler_source_wh,      // ((uint16_t)h << 16) | (uint16_t)w
+    dword_t scaled_output_xy,      // ((uint16_t)y << 16) | (uint16_t)x
+    dword_t scaled_output_wh,      // ((uint16_t)h << 16) | (uint16_t)w
+    dword_t front_buffer_wh,       // ((uint16_t)h << 16) | (uint16_t)w
+    dword_t vertical_filter_type,  // 7?
+    pointer_t<X_D3DFILTER_PARAMETERS> vertical_filter_params,    //
+    dword_t horizontal_filter_type,                              // 7?
+    pointer_t<X_D3DFILTER_PARAMETERS> horizontal_filter_params,  //
+    lpvoid_t unk9,                                               //
+    lpvoid_t dest_ptr,  // Points to the first 80000000h where the memcpy
+                        // sources from.
+    dword_t dest_count  // Count in words.
+) {
   // We could fake the commands here, but I'm not sure the game checks for
   // anything but success (non-zero ret).
   // For now, we just fill it with NOPs.
-  uint32_t total_words = 0x1CC / 4;
   auto dest = dest_ptr.as_array<uint32_t>();
-  for (size_t i = 0; i < total_words; ++i) {
+  for (size_t i = 0; i < dest_count; ++i) {
     dest[i] = 0x80000000;
   }
-
-  // returns memcpy size >> 2 for memcpy(...,...,ret << 2)
-  return total_words >> 2;
+  return (uint32_t)dest_count;
 }
 DECLARE_XBOXKRNL_EXPORT(VdInitializeScalerCommandBuffer,
                         ExportTag::kVideo | ExportTag::kSketchy);
-
-// We use these to shuffle data to VdSwap.
-// This way it gets properly stored in the command buffer (for replay/etc).
-uint32_t last_frontbuffer_width_ = 1280;
-uint32_t last_frontbuffer_height_ = 720;
 
 struct BufferScaling {
   xe::be<uint16_t> fb_width;
@@ -289,19 +283,13 @@ dword_result_t VdCallGraphicsNotificationRoutines(
 
   // TODO(benvanik): what does this mean, I forget:
   // callbacks get 0, r3, r4
-
-  // For use by VdSwap.
-  last_frontbuffer_width_ = args_ptr->fb_width;
-  last_frontbuffer_height_ = args_ptr->fb_height;
-
   return 0;
 }
 DECLARE_XBOXKRNL_EXPORT(VdCallGraphicsNotificationRoutines,
                         ExportTag::kVideo | ExportTag::kSketchy);
 
 dword_result_t VdIsHSIOTrainingSucceeded() {
-  // Not really sure what this should be - code does weird stuff here:
-  // (cntlzw    r11, r3  / extrwi    r11, r11, 1, 26)
+  // BOOL return value
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT(VdIsHSIOTrainingSucceeded,
@@ -335,25 +323,35 @@ DECLARE_XBOXKRNL_EXPORT(VdRetrainEDRAM, ExportTag::kVideo | ExportTag::kStub);
 
 void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
             lpvoid_t fetch_ptr,   // frontbuffer texture fetch
-            unknown_t unk2,       //
+            lpunknown_t unk2,     // system writeback ptr
             lpunknown_t unk3,     // buffer from VdGetSystemCommandBuffer
             lpunknown_t unk4,     // from VdGetSystemCommandBuffer (0xBEEF0001)
             lpdword_t frontbuffer_ptr,  // ptr to frontbuffer address
-            lpdword_t color_format_ptr, lpdword_t color_space_ptr,
-            lpunknown_t unk8, unknown_t unk9) {
-  gpu::xenos::xe_gpu_texture_fetch_t fetch;
-  xe::copy_and_swap_32_unaligned(
-      reinterpret_cast<uint32_t*>(&fetch),
-      reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
+            lpdword_t texture_format_ptr, lpdword_t color_space_ptr,
+            lpdword_t width, lpdword_t height) {
+  // All of these parameters are REQUIRED.
+  assert(buffer_ptr);
+  assert(fetch_ptr);
+  assert(frontbuffer_ptr);
+  assert(texture_format_ptr);
+  assert(width);
+  assert(height);
 
-  auto color_format = gpu::ColorFormat(color_format_ptr.value());
+  namespace xenos = xe::gpu::xenos;
+
+  xenos::xe_gpu_texture_fetch_t fetch;
+  xe::copy_and_swap_32_unaligned(
+      &fetch, reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
+
+  auto texture_format = gpu::TextureFormat(texture_format_ptr.value());
   auto color_space = *color_space_ptr;
-  assert_true(color_format == gpu::ColorFormat::k_8_8_8_8 ||
-              color_format == gpu::ColorFormat::kUnknown0x36);
-  assert_true(color_space == 0);
+  assert_true(texture_format == gpu::TextureFormat::k_8_8_8_8 ||
+              texture_format ==
+                  gpu::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
+  assert_true(color_space == 0);  // RGB(0)
   assert_true(*frontbuffer_ptr == fetch.address << 12);
-  assert_true(last_frontbuffer_width_ == 1 + fetch.size_2d.width);
-  assert_true(last_frontbuffer_height_ == 1 + fetch.size_2d.height);
+  assert_true(*width == 1 + fetch.size_2d.width);
+  assert_true(*height == 1 + fetch.size_2d.height);
 
   // The caller seems to reserve 64 words (256b) in the primary ringbuffer
   // for this method to do what it needs. We just zero them out and send a
@@ -362,16 +360,33 @@ void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
   // use this method.
   buffer_ptr.Zero(64 * 4);
 
-  namespace xenos = xe::gpu::xenos;
+  // virtual -> physical
+  fetch.address &= 0x1FFFF;
 
+  uint32_t offset = 0;
   auto dwords = buffer_ptr.as_array<uint32_t>();
-  dwords[0] = xenos::MakePacketType3<xenos::PM4_XE_SWAP, 63>();
-  dwords[1] = 'SWAP';
-  dwords[2] = *frontbuffer_ptr;
 
-  // Set by VdCallGraphicsNotificationRoutines.
-  dwords[3] = last_frontbuffer_width_;
-  dwords[4] = last_frontbuffer_height_;
+  // Write in the texture fetch.
+  dwords[offset++] =
+      xenos::MakePacketType0(gpu::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
+  dwords[offset++] = fetch.dword_0;
+  dwords[offset++] = fetch.dword_1;
+  dwords[offset++] = fetch.dword_2;
+  dwords[offset++] = fetch.dword_3;
+  dwords[offset++] = fetch.dword_4;
+  dwords[offset++] = fetch.dword_5;
+
+  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+  dwords[offset++] = 'SWAP';
+  dwords[offset++] = (*frontbuffer_ptr) & 0x1FFFFFFF;
+
+  dwords[offset++] = *width;
+  dwords[offset++] = *height;
+
+  // Fill the rest of the buffer with NOP packets.
+  for (uint32_t i = offset; i < 64; i++) {
+    dwords[i] = xenos::MakePacketType2();
+  }
 }
 DECLARE_XBOXKRNL_EXPORT(VdSwap, ExportTag::kVideo | ExportTag::kImportant);
 

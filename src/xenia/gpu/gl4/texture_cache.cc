@@ -427,7 +427,7 @@ TextureCache::TextureEntry* TextureCache::LookupOrInsertTexture(
   // Not found, create.
   auto entry = std::make_unique<TextureEntry>();
   entry->texture_info = texture_info;
-  entry->write_watch_handle = 0;
+  entry->access_watch_handle = 0;
   entry->pending_invalidation = false;
   entry->handle = 0;
 
@@ -442,6 +442,7 @@ TextureCache::TextureEntry* TextureCache::LookupOrInsertTexture(
       // Found! Acquire the handle and remove the readbuffer entry.
       read_buffer_textures_.erase(it);
       entry->handle = read_buffer_entry->handle;
+      entry->access_watch_handle = read_buffer_entry->access_watch_handle;
       delete read_buffer_entry;
       // TODO(benvanik): set more texture properties? swizzle/etc?
       auto entry_ptr = entry.get();
@@ -476,13 +477,15 @@ TextureCache::TextureEntry* TextureCache::LookupOrInsertTexture(
   // Upload/convert.
   bool uploaded = false;
   switch (texture_info.dimension) {
+    case Dimension::k1D:
+      uploaded = UploadTexture1D(entry->handle, texture_info);
+      break;
     case Dimension::k2D:
       uploaded = UploadTexture2D(entry->handle, texture_info);
       break;
     case Dimension::kCube:
       uploaded = UploadTextureCube(entry->handle, texture_info);
       break;
-    case Dimension::k1D:
     case Dimension::k3D:
       assert_unhandled_case(texture_info.dimension);
       return nullptr;
@@ -495,14 +498,15 @@ TextureCache::TextureEntry* TextureCache::LookupOrInsertTexture(
   // Add a write watch. If any data in the given range is touched we'll get a
   // callback and evict the texture. We could reuse the storage, though the
   // driver is likely in a better position to pool that kind of stuff.
-  entry->write_watch_handle = memory_->AddPhysicalWriteWatch(
+  entry->access_watch_handle = memory_->AddPhysicalAccessWatch(
       texture_info.guest_address, texture_info.input_length,
+      cpu::MMIOHandler::kWatchWrite,
       [](void* context_ptr, void* data_ptr, uint32_t address) {
         auto self = reinterpret_cast<TextureCache*>(context_ptr);
         auto touched_entry = reinterpret_cast<TextureEntry*>(data_ptr);
         // Clear watch handle first so we don't redundantly
         // remove.
-        touched_entry->write_watch_handle = 0;
+        touched_entry->access_watch_handle = 0;
         touched_entry->pending_invalidation = true;
         // Add to pending list so Scavenge will clean it up.
         self->invalidated_textures_mutex_.lock();
@@ -574,14 +578,27 @@ GLuint TextureCache::ConvertTexture(Blitter* blitter, uint32_t guest_address,
                                   dest_rect, GL_LINEAR, swap_channels);
     }
 
-    // HACK: remove texture from write watch list so readback won't kill us.
-    // Not needed now, as readback is disabled.
-    /*
-    if (texture_entry->write_watch_handle) {
-      memory_->CancelWriteWatch(texture_entry->write_watch_handle);
-      texture_entry->write_watch_handle = 0;
+    // Setup a read/write access watch. If the game tries to touch the memory
+    // we were supposed to populate with this texture, then we'll actually
+    // populate it.
+    if (texture_entry->access_watch_handle) {
+      memory_->CancelAccessWatch(texture_entry->access_watch_handle);
+      texture_entry->access_watch_handle = 0;
     }
-    //*/
+
+    texture_entry->access_watch_handle = memory_->AddPhysicalAccessWatch(
+        guest_address, texture_entry->texture_info.input_length,
+        cpu::MMIOHandler::kWatchReadWrite,
+        [](void* context, void* data, uint32_t address) {
+          auto touched_entry = reinterpret_cast<TextureEntry*>(data);
+          touched_entry->access_watch_handle = 0;
+
+          // This happens. RDR resolves to a texture then upsizes it, BF1943
+          // writes to a resolved texture.
+          // TODO (for Vulkan): Copy this texture back into system memory.
+          // assert_always();
+        },
+        nullptr, texture_entry);
 
     return texture_entry->handle;
   }
@@ -618,6 +635,20 @@ GLuint TextureCache::ConvertTexture(Blitter* blitter, uint32_t guest_address,
   entry->block_height = block_height;
   entry->format = format;
 
+  entry->access_watch_handle = memory_->AddPhysicalAccessWatch(
+      guest_address, block_height * block_width * 4,
+      cpu::MMIOHandler::kWatchReadWrite,
+      [](void* context, void* data, uint32_t address) {
+        auto entry = reinterpret_cast<ReadBufferTexture*>(data);
+        entry->access_watch_handle = 0;
+
+        // This happens. RDR resolves to a texture then upsizes it, BF1943
+        // writes to a resolved texture.
+        // TODO (for Vulkan): Copy this texture back into system memory.
+        // assert_always();
+      },
+      nullptr, entry.get());
+
   glCreateTextures(GL_TEXTURE_2D, 1, &entry->handle);
   glTextureParameteri(entry->handle, GL_TEXTURE_BASE_LEVEL, 0);
   glTextureParameteri(entry->handle, GL_TEXTURE_MAX_LEVEL, 1);
@@ -636,9 +667,9 @@ GLuint TextureCache::ConvertTexture(Blitter* blitter, uint32_t guest_address,
 }
 
 void TextureCache::EvictTexture(TextureEntry* entry) {
-  if (entry->write_watch_handle) {
-    memory_->CancelWriteWatch(entry->write_watch_handle);
-    entry->write_watch_handle = 0;
+  if (entry->access_watch_handle) {
+    memory_->CancelAccessWatch(entry->access_watch_handle);
+    entry->access_watch_handle = 0;
   }
 
   for (auto& view : entry->views) {
@@ -658,29 +689,164 @@ void TextureCache::EvictTexture(TextureEntry* entry) {
   delete entry;
 }
 
+struct HostTextureInfo {
+  uint32_t output_length;
+
+  union {
+    struct {
+      uint32_t output_width;
+      uint32_t output_pitch;
+    } size_1d;
+    struct {
+      uint32_t output_width;
+      uint32_t output_height;
+      uint32_t output_pitch;
+    } size_2d;
+    struct {
+    } size_3d;
+    struct {
+      uint32_t output_width;
+      uint32_t output_height;
+      uint32_t output_pitch;
+      uint32_t output_face_length;
+    } size_cube;
+  };
+
+  static bool Setup(const TextureInfo& guest_info, HostTextureInfo* out_info) {
+    auto& info = *out_info;
+    auto format = guest_info.format_info();
+
+    switch (guest_info.dimension) {
+      case Dimension::k1D: {
+        uint32_t bytes_per_block =
+            format->block_width * format->bits_per_pixel / 8;
+        uint32_t block_width = xe::round_up(guest_info.size_1d.logical_width,
+                                            format->block_width) /
+                               format->block_width;
+        info.size_1d.output_width = block_width * format->block_width;
+        info.size_1d.output_pitch = block_width * bytes_per_block;
+        info.output_length = info.size_1d.output_pitch;
+        return true;
+      }
+      case Dimension::k2D: {
+        uint32_t bytes_per_block = format->block_width * format->block_height *
+                                   format->bits_per_pixel / 8;
+        uint32_t block_width = xe::round_up(guest_info.size_2d.logical_width,
+                                            format->block_width) /
+                               format->block_width;
+        uint32_t block_height = xe::round_up(guest_info.size_2d.logical_height,
+                                             format->block_height) /
+                                format->block_height;
+        info.size_2d.output_width = block_width * format->block_width;
+        info.size_2d.output_height = block_height * format->block_height;
+        info.size_2d.output_pitch = block_width * bytes_per_block;
+        info.output_length = info.size_2d.output_pitch * block_height;
+        return true;
+      };
+      case Dimension::k3D: {
+        return false;
+      }
+      case Dimension::kCube: {
+        uint32_t bytes_per_block = format->block_width * format->block_height *
+                                   format->bits_per_pixel / 8;
+        uint32_t block_width = xe::round_up(guest_info.size_cube.logical_width,
+                                            format->block_width) /
+                               format->block_width;
+        uint32_t block_height =
+            xe::round_up(guest_info.size_cube.logical_height,
+                         format->block_height) /
+            format->block_height;
+        info.size_cube.output_width = block_width * format->block_width;
+        info.size_cube.output_height = block_height * format->block_height;
+        info.size_cube.output_pitch = block_width * bytes_per_block;
+        info.size_cube.output_face_length =
+            info.size_cube.output_pitch * block_height;
+        info.output_length = info.size_cube.output_face_length * 6;
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
 void TextureSwap(Endian endianness, void* dest, const void* src,
                  size_t length) {
   switch (endianness) {
     case Endian::k8in16:
-      xe::copy_and_swap_16_aligned(reinterpret_cast<uint16_t*>(dest),
-                                   reinterpret_cast<const uint16_t*>(src),
-                                   length / 2);
+      xe::copy_and_swap_16_aligned(dest, src, length / 2);
       break;
     case Endian::k8in32:
-      xe::copy_and_swap_32_aligned(reinterpret_cast<uint32_t*>(dest),
-                                   reinterpret_cast<const uint32_t*>(src),
-                                   length / 4);
+      xe::copy_and_swap_32_aligned(dest, src, length / 4);
       break;
     case Endian::k16in32:  // Swap high and low 16 bits within a 32 bit word
-      xe::copy_and_swap_16_in_32_aligned(reinterpret_cast<uint32_t*>(dest),
-                                         reinterpret_cast<const uint32_t*>(src),
-                                         length);
+      xe::copy_and_swap_16_in_32_aligned(dest, src, length);
       break;
     default:
     case Endian::kUnspecified:
       std::memcpy(dest, src, length);
       break;
   }
+}
+
+bool TextureCache::UploadTexture1D(GLuint texture,
+                                   const TextureInfo& texture_info) {
+  SCOPE_profile_cpu_f("gpu");
+  const auto host_address =
+      memory_->TranslatePhysical(texture_info.guest_address);
+
+  const auto& config = texture_configs[uint32_t(texture_info.texture_format)];
+  if (config.format == GL_INVALID_ENUM) {
+    assert_always("Unhandled texture format");
+    return false;
+  }
+
+  HostTextureInfo host_info;
+  if (!HostTextureInfo::Setup(texture_info, &host_info)) {
+    assert_always("Failed to set up host texture info");
+    return false;
+  }
+
+  size_t unpack_length = host_info.output_length;
+  glTextureStorage1D(texture, 1, config.internal_format,
+                     host_info.size_1d.output_width);
+
+  auto allocation = scratch_buffer_->Acquire(unpack_length);
+
+  if (!texture_info.is_tiled) {
+    if (texture_info.size_1d.input_pitch == host_info.size_1d.output_pitch) {
+      TextureSwap(texture_info.endianness, allocation.host_ptr, host_address,
+                  unpack_length);
+    } else {
+      assert_always();
+    }
+  } else {
+    assert_always();
+  }
+  size_t unpack_offset = allocation.offset;
+  scratch_buffer_->Commit(std::move(allocation));
+  // TODO(benvanik): avoid flush on entire buffer by using another texture
+  // buffer.
+  scratch_buffer_->Flush();
+
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, scratch_buffer_->handle());
+  if (texture_info.is_compressed()) {
+    glCompressedTextureSubImage1D(texture, 0, 0, host_info.size_1d.output_width,
+                                  config.format,
+                                  static_cast<GLsizei>(unpack_length),
+                                  reinterpret_cast<void*>(unpack_offset));
+  } else {
+    // Most of these don't seem to have an effect on compressed images.
+    // glPixelStorei(GL_UNPACK_SWAP_BYTES, GL_TRUE);
+    // glPixelStorei(GL_UNPACK_ALIGNMENT, texture_info.texel_pitch);
+    // glPixelStorei(GL_UNPACK_ROW_LENGTH, texture_info.size_2d.input_width);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    glTextureSubImage1D(texture, 0, 0, host_info.size_1d.output_width,
+                        config.format, config.type,
+                        reinterpret_cast<void*>(unpack_offset));
+  }
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  return true;
 }
 
 bool TextureCache::UploadTexture2D(GLuint texture,
@@ -690,21 +856,48 @@ bool TextureCache::UploadTexture2D(GLuint texture,
       memory_->TranslatePhysical(texture_info.guest_address);
 
   const auto& config =
-      texture_configs[uint32_t(texture_info.format_info->format)];
+      texture_configs[uint32_t(texture_info.format_info()->format)];
   if (config.format == GL_INVALID_ENUM) {
     assert_always("Unhandled texture format");
     return false;
   }
 
-  size_t unpack_length = texture_info.output_length;
+  HostTextureInfo host_info;
+  if (!HostTextureInfo::Setup(texture_info, &host_info)) {
+    assert_always("Failed to set up host texture info");
+    return false;
+  }
+
+  size_t unpack_length = host_info.output_length;
   glTextureStorage2D(texture, 1, config.internal_format,
-                     texture_info.size_2d.output_width,
-                     texture_info.size_2d.output_height);
+                     host_info.size_2d.output_width,
+                     host_info.size_2d.output_height);
 
   auto allocation = scratch_buffer_->Acquire(unpack_length);
 
   if (!texture_info.is_tiled) {
-    if (texture_info.size_2d.input_pitch == texture_info.size_2d.output_pitch) {
+    uint32_t offset_x, offset_y;
+    if (texture_info.has_packed_mips &&
+        TextureInfo::GetPackedTileOffset(texture_info, &offset_x, &offset_y)) {
+      uint32_t bytes_per_block = texture_info.format_info()->block_width *
+                                 texture_info.format_info()->block_height *
+                                 texture_info.format_info()->bits_per_pixel / 8;
+      const uint8_t* src = host_address;
+      // TODO(gibbed): this needs checking
+      src += offset_y * texture_info.size_2d.input_pitch;
+      src += offset_x * bytes_per_block;
+      uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
+      uint32_t pitch = std::min(texture_info.size_2d.input_pitch,
+                                host_info.size_2d.output_pitch);
+      for (uint32_t y = 0; y < std::min(texture_info.size_2d.block_height,
+                                        texture_info.size_2d.logical_height);
+           y++) {
+        TextureSwap(texture_info.endianness, dest, src, pitch);
+        src += texture_info.size_2d.input_pitch;
+        dest += host_info.size_2d.output_pitch;
+      }
+    } else if (texture_info.size_2d.input_pitch ==
+               host_info.size_2d.output_pitch) {
       // Fast path copy entire image.
       TextureSwap(texture_info.endianness, allocation.host_ptr, host_address,
                   unpack_length);
@@ -715,13 +908,13 @@ bool TextureCache::UploadTexture2D(GLuint texture,
       const uint8_t* src = host_address;
       uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
       uint32_t pitch = std::min(texture_info.size_2d.input_pitch,
-                                texture_info.size_2d.output_pitch);
+                                host_info.size_2d.output_pitch);
       for (uint32_t y = 0; y < std::min(texture_info.size_2d.block_height,
                                         texture_info.size_2d.logical_height);
            y++) {
         TextureSwap(texture_info.endianness, dest, src, pitch);
         src += texture_info.size_2d.input_pitch;
-        dest += texture_info.size_2d.output_pitch;
+        dest += host_info.size_2d.output_pitch;
       }
     }
   } else {
@@ -731,9 +924,9 @@ bool TextureCache::UploadTexture2D(GLuint texture,
     // TODO(benvanik): optimize this inner loop (or work by tiles).
     const uint8_t* src = host_address;
     uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
-    uint32_t bytes_per_block = texture_info.format_info->block_width *
-                               texture_info.format_info->block_height *
-                               texture_info.format_info->bits_per_pixel / 8;
+    uint32_t bytes_per_block = texture_info.format_info()->block_width *
+                               texture_info.format_info()->block_height *
+                               texture_info.format_info()->bits_per_pixel / 8;
 
     // Tiled textures can be packed; get the offset into the packed texture.
     uint32_t offset_x;
@@ -745,10 +938,11 @@ bool TextureCache::UploadTexture2D(GLuint texture,
     for (uint32_t y = 0, output_base_offset = 0;
          y < std::min(texture_info.size_2d.block_height,
                       texture_info.size_2d.logical_height);
-         y++, output_base_offset += texture_info.size_2d.output_pitch) {
+         y++, output_base_offset += host_info.size_2d.output_pitch) {
       auto input_base_offset = TextureInfo::TiledOffset2DOuter(
-          offset_y + y, (texture_info.size_2d.input_width /
-                         texture_info.format_info->block_width),
+          offset_y + y,
+          (texture_info.size_2d.input_width /
+           texture_info.format_info()->block_width),
           bpp);
       for (uint32_t x = 0, output_offset = output_base_offset;
            x < texture_info.size_2d.block_width;
@@ -771,8 +965,8 @@ bool TextureCache::UploadTexture2D(GLuint texture,
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, scratch_buffer_->handle());
   if (texture_info.is_compressed()) {
     glCompressedTextureSubImage2D(
-        texture, 0, 0, 0, texture_info.size_2d.output_width,
-        texture_info.size_2d.output_height, config.format,
+        texture, 0, 0, 0, host_info.size_2d.output_width,
+        host_info.size_2d.output_height, config.format,
         static_cast<GLsizei>(unpack_length),
         reinterpret_cast<void*>(unpack_offset));
   } else {
@@ -782,8 +976,8 @@ bool TextureCache::UploadTexture2D(GLuint texture,
     // glPixelStorei(GL_UNPACK_ROW_LENGTH, texture_info.size_2d.input_width);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    glTextureSubImage2D(texture, 0, 0, 0, texture_info.size_2d.output_width,
-                        texture_info.size_2d.output_height, config.format,
+    glTextureSubImage2D(texture, 0, 0, 0, host_info.size_2d.output_width,
+                        host_info.size_2d.output_height, config.format,
                         config.type, reinterpret_cast<void*>(unpack_offset));
   }
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -797,21 +991,27 @@ bool TextureCache::UploadTextureCube(GLuint texture,
       memory_->TranslatePhysical(texture_info.guest_address);
 
   const auto& config =
-      texture_configs[uint32_t(texture_info.format_info->format)];
+      texture_configs[uint32_t(texture_info.format_info()->format)];
   if (config.format == GL_INVALID_ENUM) {
     assert_always("Unhandled texture format");
     return false;
   }
 
-  size_t unpack_length = texture_info.output_length;
+  HostTextureInfo host_info;
+  if (!HostTextureInfo::Setup(texture_info, &host_info)) {
+    assert_always("Failed to set up host texture info");
+    return false;
+  }
+
+  size_t unpack_length = host_info.output_length;
   glTextureStorage2D(texture, 1, config.internal_format,
-                     texture_info.size_cube.output_width,
-                     texture_info.size_cube.output_height);
+                     host_info.size_cube.output_width,
+                     host_info.size_cube.output_height);
 
   auto allocation = scratch_buffer_->Acquire(unpack_length);
   if (!texture_info.is_tiled) {
     if (texture_info.size_cube.input_pitch ==
-        texture_info.size_cube.output_pitch) {
+        host_info.size_cube.output_pitch) {
       // Fast path copy entire image.
       TextureSwap(texture_info.endianness, allocation.host_ptr, host_address,
                   unpack_length);
@@ -823,11 +1023,11 @@ bool TextureCache::UploadTextureCube(GLuint texture,
       uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
       for (int face = 0; face < 6; ++face) {
         uint32_t pitch = std::min(texture_info.size_cube.input_pitch,
-                                  texture_info.size_cube.output_pitch);
+                                  host_info.size_cube.output_pitch);
         for (uint32_t y = 0; y < texture_info.size_cube.block_height; y++) {
           TextureSwap(texture_info.endianness, dest, src, pitch);
           src += texture_info.size_cube.input_pitch;
-          dest += texture_info.size_cube.output_pitch;
+          dest += host_info.size_cube.output_pitch;
         }
       }
     }
@@ -835,9 +1035,9 @@ bool TextureCache::UploadTextureCube(GLuint texture,
     // TODO(benvanik): optimize this inner loop (or work by tiles).
     const uint8_t* src = host_address;
     uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
-    uint32_t bytes_per_block = texture_info.format_info->block_width *
-                               texture_info.format_info->block_height *
-                               texture_info.format_info->bits_per_pixel / 8;
+    uint32_t bytes_per_block = texture_info.format_info()->block_width *
+                               texture_info.format_info()->block_height *
+                               texture_info.format_info()->bits_per_pixel / 8;
     // Tiled textures can be packed; get the offset into the packed texture.
     uint32_t offset_x;
     uint32_t offset_y;
@@ -847,10 +1047,11 @@ bool TextureCache::UploadTextureCube(GLuint texture,
     for (int face = 0; face < 6; ++face) {
       for (uint32_t y = 0, output_base_offset = 0;
            y < texture_info.size_cube.block_height;
-           y++, output_base_offset += texture_info.size_cube.output_pitch) {
+           y++, output_base_offset += host_info.size_cube.output_pitch) {
         auto input_base_offset = TextureInfo::TiledOffset2DOuter(
-            offset_y + y, (texture_info.size_cube.input_width /
-                           texture_info.format_info->block_width),
+            offset_y + y,
+            (texture_info.size_cube.input_width /
+             texture_info.format_info()->block_width),
             bpp);
         for (uint32_t x = 0, output_offset = output_base_offset;
              x < texture_info.size_cube.block_width;
@@ -864,7 +1065,7 @@ bool TextureCache::UploadTextureCube(GLuint texture,
         }
       }
       src += texture_info.size_cube.input_face_length;
-      dest += texture_info.size_cube.output_face_length;
+      dest += host_info.size_cube.output_face_length;
     }
   }
   size_t unpack_offset = allocation.offset;
@@ -876,8 +1077,8 @@ bool TextureCache::UploadTextureCube(GLuint texture,
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, scratch_buffer_->handle());
   if (texture_info.is_compressed()) {
     glCompressedTextureSubImage3D(
-        texture, 0, 0, 0, 0, texture_info.size_cube.output_width,
-        texture_info.size_cube.output_height, 6, config.format,
+        texture, 0, 0, 0, 0, host_info.size_cube.output_width,
+        host_info.size_cube.output_height, 6, config.format,
         static_cast<GLsizei>(unpack_length),
         reinterpret_cast<void*>(unpack_offset));
   } else {
@@ -887,9 +1088,8 @@ bool TextureCache::UploadTextureCube(GLuint texture,
     // glPixelStorei(GL_UNPACK_ROW_LENGTH, texture_info.size_2d.input_width);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    glTextureSubImage3D(texture, 0, 0, 0, 0,
-                        texture_info.size_cube.output_width,
-                        texture_info.size_cube.output_height, 6, config.format,
+    glTextureSubImage3D(texture, 0, 0, 0, 0, host_info.size_cube.output_width,
+                        host_info.size_cube.output_height, 6, config.format,
                         config.type, reinterpret_cast<void*>(unpack_offset));
   }
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);

@@ -65,27 +65,33 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
   }
 
   char level_char = '?';
+  LogLevel log_level;
   switch (level) {
     case AV_LOG_ERROR:
       level_char = '!';
+      log_level = xe::LogLevel::LOG_LEVEL_ERROR;
       break;
     case AV_LOG_WARNING:
       level_char = 'w';
+      log_level = xe::LogLevel::LOG_LEVEL_WARNING;
       break;
     case AV_LOG_INFO:
       level_char = 'i';
+      log_level = xe::LogLevel::LOG_LEVEL_INFO;
       break;
     case AV_LOG_VERBOSE:
       level_char = 'v';
+      log_level = xe::LogLevel::LOG_LEVEL_DEBUG;
       break;
     case AV_LOG_DEBUG:
       level_char = 'd';
+      log_level = xe::LogLevel::LOG_LEVEL_DEBUG;
       break;
   }
 
   StringBuffer buff;
   buff.AppendVarargs(fmt, va);
-  xe::LogLineFormat(level_char, "libav: %s", buff.GetString());
+  xe::LogLineFormat(log_level, level_char, "libav: %s", buff.GetString());
 }
 
 X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
@@ -115,8 +121,10 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
     }
   }
   registers_.next_context = 1;
+  context_bitmap_.Resize(kContextCount);
 
   worker_running_ = true;
+  work_event_ = xe::threading::Event::CreateAutoResetEvent(false);
   worker_thread_ = kernel::object_ref<kernel::XHostThread>(
       new kernel::XHostThread(kernel_state, 128 * 1024, 0, [this]() {
         WorkerThreadMain();
@@ -130,24 +138,51 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  uint32_t idle_loop_count = 0;
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
+    bool did_work = false;
     for (uint32_t n = 0; n < kContextCount; n++) {
       XmaContext& context = contexts_[n];
-      context.Work();
+      did_work = context.Work() || did_work;
 
       // TODO: Need thread safety to do this.
       // Probably not too important though.
       // registers_.current_context = n;
       // registers_.next_context = (n + 1) % kContextCount;
     }
+
+    if (paused_) {
+      pause_fence_.Signal();
+      resume_fence_.Wait();
+    }
+
+    if (!did_work) {
+      idle_loop_count++;
+    } else {
+      idle_loop_count = 0;
+    }
+
+    if (idle_loop_count > 500) {
+      // Idle for an extended period. Introduce a 20ms wait.
+      xe::threading::Wait(work_event_.get(), false,
+                          std::chrono::milliseconds(20));
+    }
+
     xe::threading::MaybeYield();
   }
 }
 
 void XmaDecoder::Shutdown() {
   worker_running_ = false;
-  worker_fence_.Signal();
+  work_event_->Set();
+
+  if (paused_) {
+    Resume();
+  }
+
+  // Wait for work thread.
+  xe::threading::Wait(worker_thread_->thread(), false);
   worker_thread_.reset();
 
   memory()->SystemHeapFree(registers_.context_array_ptr);
@@ -164,32 +199,29 @@ int XmaDecoder::GetContextId(uint32_t guest_ptr) {
 }
 
 uint32_t XmaDecoder::AllocateContext() {
-  std::lock_guard<std::mutex> lock(lock_);
-
-  for (uint32_t n = 0; n < kContextCount; n++) {
-    XmaContext& context = contexts_[n];
-    if (!context.is_allocated()) {
-      context.set_is_allocated(true);
-      return context.guest_ptr();
-    }
+  size_t index = context_bitmap_.Acquire();
+  if (index == -1) {
+    // Out of contexts.
+    return 0;
   }
 
-  return 0;
+  XmaContext& context = contexts_[index];
+  assert_false(context.is_allocated());
+  context.set_is_allocated(true);
+  return context.guest_ptr();
 }
 
 void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
-  std::lock_guard<std::mutex> lock(lock_);
-
   auto context_id = GetContextId(guest_ptr);
   assert_true(context_id >= 0);
 
   XmaContext& context = contexts_[context_id];
+  assert_true(context.is_allocated());
   context.Release();
+  context_bitmap_.Release(context_id);
 }
 
 bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
-  std::lock_guard<std::mutex> lock(lock_);
-
   auto context_id = GetContextId(guest_ptr);
   assert_true(context_id >= 0);
 
@@ -253,7 +285,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     }
 
     // Signal the decoder thread to start processing.
-    worker_fence_.Signal();
+    work_event_->Set();
   } else if (r >= 0x1A40 && r <= 0x1A40 + 9 * 4) {
     // Context lock command.
     // This requests a lock by flagging the context.
@@ -268,7 +300,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     }
 
     // Signal the decoder thread to start processing.
-    worker_fence_.Signal();
+    work_event_->Set();
   } else if (r >= 0x1A80 && r <= 0x1A80 + 9 * 4) {
     // Context clear command.
     // This will reset the given hardware contexts.
@@ -281,6 +313,24 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
     }
   }
+}
+
+void XmaDecoder::Pause() {
+  if (paused_) {
+    return;
+  }
+  paused_ = true;
+
+  pause_fence_.Wait();
+}
+
+void XmaDecoder::Resume() {
+  if (!paused_) {
+    return;
+  }
+  paused_ = false;
+
+  resume_fence_.Signal();
 }
 
 }  // namespace apu

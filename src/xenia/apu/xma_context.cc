@@ -98,10 +98,10 @@ int XmaContext::Setup(uint32_t id, Memory* memory, uint32_t guest_ptr) {
   return 0;
 }
 
-void XmaContext::Work() {
+bool XmaContext::Work() {
   std::lock_guard<std::mutex> lock(lock_);
   if (!is_allocated() || !is_enabled()) {
-    return;
+    return false;
   }
 
   set_is_enabled(false);
@@ -110,6 +110,7 @@ void XmaContext::Work() {
   XMA_CONTEXT_DATA data(context_ptr);
   DecodePackets(&data);
   data.Store(context_ptr);
+  return true;
 }
 
 void XmaContext::Enable() {
@@ -224,6 +225,11 @@ bool XmaContext::ValidFrameOffset(uint8_t* block, size_t size_bytes,
                                   size_t frame_offset_bits) {
   uint32_t packet_num =
       GetFramePacketNumber(block, size_bytes, frame_offset_bits);
+  if (packet_num == -1) {
+    // Invalid packet number
+    return false;
+  }
+
   uint8_t* packet = block + (packet_num * kBytesPerPacket);
   size_t relative_offset_bits = frame_offset_bits % (kBytesPerPacket * 8);
 
@@ -298,8 +304,6 @@ void XmaContext::DecodePackets(XMA_CONTEXT_DATA* data) {
   if (!data->input_buffer_0_valid && !data->input_buffer_1_valid) {
     return;
   }
-
-  assert_zero(data->unk_dword_9);
 
   // XAudio Loops
   // loop_count:

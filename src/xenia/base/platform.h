@@ -47,6 +47,14 @@
 #define XE_COMPILER_UNKNOWN 1
 #endif
 
+#if defined(_M_AMD64) || defined(__amd64__)
+#define XE_ARCH_AMD64 1
+#elif defined(_M_IX86)
+#error "Xenia is not supported on 32-bit platforms."
+#elif defined(_M_PPC) || defined(__powerpc__)
+#define XE_ARCH_PPC 1
+#endif
+
 #if XE_PLATFORM_WIN32
 #define strdup _strdup
 #define strcasecmp _stricmp
@@ -57,13 +65,28 @@
 
 #if XE_PLATFORM_WIN32
 #include <intrin.h>
-#else
+#elif XE_ARCH_AMD64
 #include <x86intrin.h>
 #endif  // XE_PLATFORM_WIN32
 
 #if XE_PLATFORM_MAC
 #include <libkern/OSByteOrder.h>
 #endif  // XE_PLATFORM_MAC
+
+#if XE_COMPILER_MSVC
+#define XEPACKEDSTRUCT(name, value)                                  \
+  __pragma(pack(push, 1)) struct name##_s value __pragma(pack(pop)); \
+  typedef struct name##_s name;
+#define XEPACKEDSTRUCTANONYMOUS(value) \
+  __pragma(pack(push, 1)) struct value __pragma(pack(pop));
+#define XEPACKEDUNION(name, value)                                  \
+  __pragma(pack(push, 1)) union name##_s value __pragma(pack(pop)); \
+  typedef union name##_s name;
+#else
+#define XEPACKEDSTRUCT(name, value) struct __attribute__((packed)) name value;
+#define XEPACKEDSTRUCTANONYMOUS(value) struct __attribute__((packed)) value;
+#define XEPACKEDUNION(name, value) union __attribute__((packed)) name value;
+#endif  // XE_PLATFORM_WIN32
 
 namespace xe {
 

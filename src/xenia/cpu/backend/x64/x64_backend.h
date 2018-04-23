@@ -38,11 +38,11 @@ class X64Backend : public Backend {
  public:
   static const uint32_t kForceReturnAddress = 0x9FFF0000u;
 
-  explicit X64Backend(Processor* processor);
+  explicit X64Backend();
   ~X64Backend() override;
 
   X64CodeCache* code_cache() const { return code_cache_.get(); }
-  uint32_t emitter_data() const { return emitter_data_; }
+  uintptr_t emitter_data() const { return emitter_data_; }
 
   // Call a generated function, saving all stack parameters.
   HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
@@ -53,7 +53,7 @@ class X64Backend : public Backend {
     return resolve_function_thunk_;
   }
 
-  bool Initialize() override;
+  bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
 
@@ -76,8 +76,7 @@ class X64Backend : public Backend {
   uintptr_t capstone_handle_ = 0;
 
   std::unique_ptr<X64CodeCache> code_cache_;
-
-  uint32_t emitter_data_;
+  uintptr_t emitter_data_ = 0;
 
   HostToGuestThunk host_to_guest_thunk_;
   GuestToHostThunk guest_to_host_thunk_;

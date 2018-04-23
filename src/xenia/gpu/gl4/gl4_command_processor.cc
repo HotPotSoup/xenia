@@ -782,7 +782,9 @@ GL4CommandProcessor::UpdateStatus GL4CommandProcessor::UpdateRenderTargets() {
   GLuint color_targets[4] = {kAnyTarget, kAnyTarget, kAnyTarget, kAnyTarget};
   if (enable_mode == ModeControl::kColorDepth) {
     uint32_t color_info[4] = {
-        regs.rb_color_info, regs.rb_color1_info, regs.rb_color2_info,
+        regs.rb_color_info,
+        regs.rb_color1_info,
+        regs.rb_color2_info,
         regs.rb_color3_info,
     };
     // A2XX_RB_COLOR_MASK_WRITE_* == D3DRS_COLORWRITEENABLE
@@ -1099,7 +1101,9 @@ GL4CommandProcessor::UpdateStatus GL4CommandProcessor::UpdateRasterizerState(
   }
 
   static const GLenum kFillModes[3] = {
-      GL_POINT, GL_LINE, GL_FILL,
+      GL_POINT,
+      GL_LINE,
+      GL_FILL,
   };
   bool poly_mode = ((regs.pa_su_sc_mode_cntl >> 3) & 0x3) != 0;
   if (poly_mode) {
@@ -1410,7 +1414,7 @@ GL4CommandProcessor::UpdateStatus GL4CommandProcessor::PopulateVertexBuffers() {
       // as we copy and only if it differs from the previous value committing
       // it (and if it matches just discard and reuse).
       xe::copy_and_swap_32_aligned(
-          reinterpret_cast<uint32_t*>(allocation.host_ptr),
+          allocation.host_ptr,
           memory_->TranslatePhysical<const uint32_t*>(fetch->address << 2),
           valid_range / 4);
 
@@ -1590,7 +1594,8 @@ bool GL4CommandProcessor::IssueCopy() {
   if (copy_src_select <= 3 || color_clear_enabled) {
     // Source from a color target.
     uint32_t color_info[4] = {
-        regs[XE_GPU_REG_RB_COLOR_INFO].u32, regs[XE_GPU_REG_RB_COLOR1_INFO].u32,
+        regs[XE_GPU_REG_RB_COLOR_INFO].u32,
+        regs[XE_GPU_REG_RB_COLOR1_INFO].u32,
         regs[XE_GPU_REG_RB_COLOR2_INFO].u32,
         regs[XE_GPU_REG_RB_COLOR3_INFO].u32,
     };
@@ -1691,12 +1696,12 @@ bool GL4CommandProcessor::IssueCopy() {
     case ColorFormat::k_16_16_16_16:
       read_format = GL_RGBA16;
       read_type = GL_UNSIGNED_SHORT;
-      read_size = 32;
+      read_size = 64;
       break;
     case ColorFormat::k_16_16_16_16_FLOAT:
       read_format = GL_RGBA16F;
       read_type = GL_HALF_FLOAT;
-      read_size = 32;
+      read_size = 64;
       break;
     case ColorFormat::k_32_FLOAT:
       read_format = GL_R32F;
@@ -1754,7 +1759,7 @@ bool GL4CommandProcessor::IssueCopy() {
   uint32_t dest_logical_width = copy_dest_pitch;
   uint32_t dest_logical_height = copy_dest_height;
   uint32_t dest_block_width = xe::round_up(dest_logical_width, 32);
-  uint32_t dest_block_height = xe::round_up(dest_logical_height, 32);
+  uint32_t dest_block_height = /*xe::round_up(*/ dest_logical_height /*, 32)*/;
 
   uint32_t window_offset = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET].u32;
   int16_t window_offset_x = window_offset & 0x7FFF;
@@ -1816,8 +1821,8 @@ bool GL4CommandProcessor::IssueCopy() {
   // offset, so to ensure texture lookup works we need to offset it.
   // TODO(benvanik): allow texture cache to lookup partial textures.
   // TODO(benvanik): change based on format.
-  int32_t dest_offset = window_offset_y * copy_dest_pitch * 4;
-  dest_offset += window_offset_x * 32 * 4;
+  int32_t dest_offset = window_offset_y * copy_dest_pitch * int(read_size / 8);
+  dest_offset += window_offset_x * 32 * int(read_size / 8);
   copy_dest_base += dest_offset;
 
   // Destination pointer in guest memory.
@@ -1968,20 +1973,6 @@ GLuint GL4CommandProcessor::GetColorRenderTarget(
     format = ColorRenderTargetFormat::k_8_8_8_8;
   }
 
-  for (auto it = cached_color_render_targets_.begin();
-       it != cached_color_render_targets_.end(); ++it) {
-    if (it->base == base && it->width == width && it->height == height &&
-        it->format == format) {
-      return it->texture;
-    }
-  }
-  cached_color_render_targets_.push_back(CachedColorRenderTarget());
-  auto cached = &cached_color_render_targets_.back();
-  cached->base = base;
-  cached->width = width;
-  cached->height = height;
-  cached->format = format;
-
   GLenum internal_format;
   switch (format) {
     case ColorRenderTargetFormat::k_8_8_8_8:
@@ -2019,6 +2010,21 @@ GLuint GL4CommandProcessor::GetColorRenderTarget(
       return 0;
   }
 
+  for (auto it = cached_color_render_targets_.begin();
+       it != cached_color_render_targets_.end(); ++it) {
+    if (it->base == base && it->width == width && it->height == height &&
+        it->internal_format == internal_format) {
+      return it->texture;
+    }
+  }
+  cached_color_render_targets_.push_back(CachedColorRenderTarget());
+  auto cached = &cached_color_render_targets_.back();
+  cached->base = base;
+  cached->width = width;
+  cached->height = height;
+  cached->format = format;
+  cached->internal_format = internal_format;
+
   glCreateTextures(GL_TEXTURE_2D, 1, &cached->texture);
   glTextureStorage2D(cached->texture, 1, internal_format, width, height);
 
@@ -2030,20 +2036,6 @@ GLuint GL4CommandProcessor::GetDepthRenderTarget(
     DepthRenderTargetFormat format) {
   uint32_t width = 2560;
   uint32_t height = 2560;
-
-  for (auto it = cached_depth_render_targets_.begin();
-       it != cached_depth_render_targets_.end(); ++it) {
-    if (it->base == base && it->width == width && it->height == height &&
-        it->format == format) {
-      return it->texture;
-    }
-  }
-  cached_depth_render_targets_.push_back(CachedDepthRenderTarget());
-  auto cached = &cached_depth_render_targets_.back();
-  cached->base = base;
-  cached->width = width;
-  cached->height = height;
-  cached->format = format;
 
   GLenum internal_format;
   switch (format) {
@@ -2058,6 +2050,21 @@ GLuint GL4CommandProcessor::GetDepthRenderTarget(
       assert_unhandled_case(format);
       return 0;
   }
+
+  for (auto it = cached_depth_render_targets_.begin();
+       it != cached_depth_render_targets_.end(); ++it) {
+    if (it->base == base && it->width == width && it->height == height &&
+        it->format == format) {
+      return it->texture;
+    }
+  }
+  cached_depth_render_targets_.push_back(CachedDepthRenderTarget());
+  auto cached = &cached_depth_render_targets_.back();
+  cached->base = base;
+  cached->width = width;
+  cached->height = height;
+  cached->format = format;
+  cached->internal_format = internal_format;
 
   glCreateTextures(GL_TEXTURE_2D, 1, &cached->texture);
   glTextureStorage2D(cached->texture, 1, internal_format, width, height);

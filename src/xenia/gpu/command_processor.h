@@ -47,6 +47,8 @@ struct SwapState {
   uintptr_t front_buffer_texture = 0;
   // Current back buffer, being updated by the CP.
   uintptr_t back_buffer_texture = 0;
+  // Backend data
+  void* backend_data = nullptr;
   // Whether the back buffer is dirty and a swap is pending.
   bool pending = false;
 };
@@ -84,9 +86,9 @@ class CommandProcessor {
     swap_request_handler_ = fn;
   }
 
-  void RequestFrameTrace(const std::wstring& root_path);
-  void BeginTracing(const std::wstring& root_path);
-  void EndTracing();
+  virtual void RequestFrameTrace(const std::wstring& root_path);
+  virtual void BeginTracing(const std::wstring& root_path);
+  virtual void EndTracing();
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t page_count);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size);
@@ -115,7 +117,7 @@ class CommandProcessor {
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
-  void WriteRegister(uint32_t index, uint32_t value);
+  virtual void WriteRegister(uint32_t index, uint32_t value);
 
   virtual void MakeCoherent();
   virtual void PrepareForWait();
@@ -212,6 +214,9 @@ class CommandProcessor {
   SwapState swap_state_;
   std::function<void()> swap_request_handler_;
   std::queue<std::function<void()>> pending_fns_;
+
+  // MicroEngine binary from PM4_ME_INIT
+  std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
 

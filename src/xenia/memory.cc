@@ -24,8 +24,7 @@
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
 
-DEFINE_bool(protect_zero, false,
-            "Protect the zero page from reads and writes.");
+DEFINE_bool(protect_zero, true, "Protect the zero page from reads and writes.");
 DEFINE_bool(protect_on_release, false,
             "Protect released memory to prevent accesses.");
 
@@ -172,12 +171,14 @@ bool Memory::Initialize() {
   heaps_.vE0000000.Initialize(virtual_membase_, 0xE0000000, 0x1FD00000, 4096,
                               &heaps_.physical);
 
-  // Take the first page at 0 so we can check for writes.
+  // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(
-      0x00000000, 64 * 1024, 64 * 1024,
+      0x00000000, 0x10000, 0x10000,
       kMemoryAllocationReserve | kMemoryAllocationCommit,
       !FLAGS_protect_zero ? kMemoryProtectRead | kMemoryProtectWrite
                           : kMemoryProtectNoAccess);
+  heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000,
+                             kMemoryAllocationReserve, kMemoryProtectNoAccess);
 
   // GPU writeback.
   // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
@@ -210,39 +211,57 @@ static const struct {
 } map_info[] = {
     // (1024mb) - virtual 4k pages
     {
-        0x00000000, 0x3FFFFFFF, 0x0000000000000000ull,
+        0x00000000,
+        0x3FFFFFFF,
+        0x0000000000000000ull,
     },
     // (1024mb) - virtual 64k pages (cont)
     {
-        0x40000000, 0x7EFFFFFF, 0x0000000040000000ull,
+        0x40000000,
+        0x7EFFFFFF,
+        0x0000000040000000ull,
     },
     //   (16mb) - GPU writeback + 15mb of XPS?
     {
-        0x7F000000, 0x7FFFFFFF, 0x0000000100000000ull,
+        0x7F000000,
+        0x7FFFFFFF,
+        0x0000000100000000ull,
     },
     //  (256mb) - xex 64k pages
     {
-        0x80000000, 0x8FFFFFFF, 0x0000000080000000ull,
+        0x80000000,
+        0x8FFFFFFF,
+        0x0000000080000000ull,
     },
     //  (256mb) - xex 4k pages
     {
-        0x90000000, 0x9FFFFFFF, 0x0000000080000000ull,
+        0x90000000,
+        0x9FFFFFFF,
+        0x0000000080000000ull,
     },
     //  (512mb) - physical 64k pages
     {
-        0xA0000000, 0xBFFFFFFF, 0x0000000100000000ull,
+        0xA0000000,
+        0xBFFFFFFF,
+        0x0000000100000000ull,
     },
     //          - physical 16mb pages
     {
-        0xC0000000, 0xDFFFFFFF, 0x0000000100000000ull,
+        0xC0000000,
+        0xDFFFFFFF,
+        0x0000000100000000ull,
     },
     //          - physical 4k pages
     {
-        0xE0000000, 0xFFFFFFFF, 0x0000000100000000ull,
+        0xE0000000,
+        0xFFFFFFFF,
+        0x0000000100000000ull,
     },
     //          - physical raw
     {
-        0x100000000, 0x11FFFFFFF, 0x0000000100000000ull,
+        0x100000000,
+        0x11FFFFFFF,
+        0x0000000100000000ull,
     },
 };
 int Memory::MapViews(uint8_t* mapping_base) {
@@ -320,6 +339,8 @@ BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) {
   }
 }
 
+VirtualHeap* Memory::GetPhysicalHeap() { return &heaps_.physical; }
+
 void Memory::Zero(uint32_t address, uint32_t size) {
   std::memset(TranslateVirtual(address), 0, size);
 }
@@ -376,17 +397,19 @@ cpu::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
-uintptr_t Memory::AddPhysicalWriteWatch(uint32_t physical_address,
-                                        uint32_t length,
-                                        cpu::WriteWatchCallback callback,
-                                        void* callback_context,
-                                        void* callback_data) {
-  return mmio_handler_->AddPhysicalWriteWatch(
-      physical_address, length, callback, callback_context, callback_data);
+uintptr_t Memory::AddPhysicalAccessWatch(uint32_t physical_address,
+                                         uint32_t length,
+                                         cpu::MMIOHandler::WatchType type,
+                                         cpu::AccessWatchCallback callback,
+                                         void* callback_context,
+                                         void* callback_data) {
+  return mmio_handler_->AddPhysicalAccessWatch(physical_address, length, type,
+                                               callback, callback_context,
+                                               callback_data);
 }
 
-void Memory::CancelWriteWatch(uintptr_t watch_handle) {
-  mmio_handler_->CancelWriteWatch(watch_handle);
+void Memory::CancelAccessWatch(uintptr_t watch_handle) {
+  mmio_handler_->CancelAccessWatch(watch_handle);
 }
 
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment,
@@ -453,6 +476,7 @@ bool Memory::Save(ByteStream* stream) {
 }
 
 bool Memory::Restore(ByteStream* stream) {
+  XELOGD("Restoring memory...");
   heaps_.v00000000.Restore(stream);
   heaps_.v40000000.Restore(stream);
   heaps_.v80000000.Restore(stream);
@@ -471,6 +495,23 @@ xe::memory::PageAccess ToPageAccess(uint32_t protect) {
   } else {
     return xe::memory::PageAccess::kNoAccess;
   }
+}
+
+uint32_t FromPageAccess(xe::memory::PageAccess protect) {
+  switch (protect) {
+    case memory::PageAccess::kNoAccess:
+      return kMemoryProtectNoAccess;
+    case memory::PageAccess::kReadOnly:
+      return kMemoryProtectRead;
+    case memory::PageAccess::kReadWrite:
+      return kMemoryProtectRead | kMemoryProtectWrite;
+    case memory::PageAccess::kExecuteReadWrite:
+      // Guest memory cannot be executable - this should never happen :)
+      assert_always();
+      return kMemoryProtectRead | kMemoryProtectWrite;
+  }
+
+  return kMemoryProtectNoAccess;
 }
 
 BaseHeap::BaseHeap()
@@ -548,6 +589,35 @@ void BaseHeap::DumpMap() {
   }
 }
 
+uint32_t BaseHeap::GetTotalPageCount() { return uint32_t(page_table_.size()); }
+
+uint32_t BaseHeap::GetUnreservedPageCount() {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t count = 0;
+  bool is_empty_span = false;
+  uint32_t empty_span_start = 0;
+  uint32_t size = uint32_t(page_table_.size());
+  for (uint32_t i = 0; i < size; ++i) {
+    auto& page = page_table_[i];
+    if (!page.state) {
+      if (!is_empty_span) {
+        is_empty_span = true;
+        empty_span_start = i;
+      }
+      continue;
+    }
+    if (is_empty_span) {
+      is_empty_span = false;
+      count += i - empty_span_start;
+    }
+    i += page.region_page_count - 1;
+  }
+  if (is_empty_span) {
+    count += size - empty_span_start;
+  }
+  return count;
+}
+
 bool BaseHeap::Save(ByteStream* stream) {
   XELOGD("Heap %.8X-%.8X", heap_base_, heap_base_ + heap_size_);
 
@@ -577,6 +647,8 @@ bool BaseHeap::Save(ByteStream* stream) {
 }
 
 bool BaseHeap::Restore(ByteStream* stream) {
+  XELOGD("Heap %.8X-%.8X", heap_base_, heap_base_ + heap_size_);
+
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
     page.qword = stream->Read<uint64_t>();
@@ -746,7 +818,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   uint32_t page_scan_stride = alignment / page_size_;
   high_page_number = high_page_number - (high_page_number % page_scan_stride);
   if (top_down) {
-    for (int64_t base_page_number = high_page_number - page_count;
+    for (int64_t base_page_number =
+             high_page_number - xe::round_up(page_count, page_scan_stride);
          base_page_number >= low_page_number;
          base_page_number -= page_scan_stride) {
       if (page_table_[base_page_number].state != 0) {
@@ -897,7 +970,12 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto base_page_entry = page_table_[base_page_number];
   if (base_page_entry.base_address != base_page_number) {
     XELOGE("BaseHeap::Release failed because address is not a region start");
-    // return false;
+    return false;
+  }
+
+  if (heap_base_ == 0x00000000 && base_page_number == 0) {
+    XELOGE("BaseHeap::Release: Attempt to free 0!");
+    return false;
   }
 
   if (out_region_size) {
@@ -943,7 +1021,8 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   return true;
 }
 
-bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect) {
+bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                       uint32_t* old_protect) {
   uint32_t page_count = xe::round_up(size, page_size_) / page_size_;
   uint32_t start_page_number = (address - heap_base_) / page_size_;
   uint32_t end_page_number = start_page_number + page_count - 1;
@@ -975,14 +1054,21 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect) {
   if (page_size_ == xe::memory::page_size() ||
       (((page_count * page_size_) % xe::memory::page_size() == 0) &&
        ((start_page_number * page_size_) % xe::memory::page_size() == 0))) {
+    memory::PageAccess old_protect_access;
     if (!xe::memory::Protect(
             membase_ + heap_base_ + start_page_number * page_size_,
-            page_count * page_size_, ToPageAccess(protect), nullptr)) {
+            page_count * page_size_, ToPageAccess(protect),
+            old_protect ? &old_protect_access : nullptr)) {
       XELOGE("BaseHeap::Protect failed due to host VirtualProtect failure");
       return false;
     }
+
+    if (old_protect) {
+      *old_protect = FromPageAccess(old_protect_access);
+    }
   } else {
-    XELOGW("BaseHeap::Protect: ignoring request as not 64k page aligned");
+    XELOGW("BaseHeap::Protect: ignoring request as not 4k page aligned");
+    return false;
   }
 
   // Perform table change.
@@ -1012,16 +1098,19 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address,
   out_info->region_size = 0;
   out_info->state = 0;
   out_info->protect = 0;
-  out_info->type = 0;
   if (start_page_entry.state) {
     // Committed/reserved region.
     out_info->allocation_base = start_page_entry.base_address * page_size_;
     out_info->allocation_protect = start_page_entry.allocation_protect;
+    out_info->allocation_size = start_page_entry.region_page_count * page_size_;
     out_info->state = start_page_entry.state;
     out_info->protect = start_page_entry.current_protect;
-    out_info->type = 0x20000;
+
+    // Scan forward and report the size of the region matching the initial
+    // base address's attributes.
     for (uint32_t page_number = start_page_number;
-         page_number < start_page_number + start_page_entry.region_page_count;
+         page_number <
+         start_page_entry.base_address + start_page_entry.region_page_count;
          ++page_number) {
       auto page_entry = page_table_[page_number];
       if (page_entry.base_address != start_page_entry.base_address ||
@@ -1056,6 +1145,20 @@ bool BaseHeap::QuerySize(uint32_t address, uint32_t* out_size) {
   }
   auto global_lock = global_critical_region_.Acquire();
   auto page_entry = page_table_[page_number];
+  *out_size = (page_entry.region_page_count * page_size_);
+  return true;
+}
+
+bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) {
+  uint32_t page_number = (*in_out_address - heap_base_) / page_size_;
+  if (page_number > page_table_.size()) {
+    XELOGE("BaseHeap::QuerySize base page out of range");
+    *out_size = 0;
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto page_entry = page_table_[page_number];
+  *in_out_address = (page_entry.base_address * page_size_);
   *out_size = (page_entry.region_page_count * page_size_);
   return true;
 }
@@ -1254,12 +1357,13 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   return BaseHeap::Release(base_address, out_region_size);
 }
 
-bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect) {
+bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                           uint32_t* old_protect) {
   auto global_lock = global_critical_region_.Acquire();
   uint32_t parent_address = GetPhysicalAddress(address);
   cpu::MMIOHandler::global_handler()->InvalidateRange(parent_address, size);
 
-  if (!parent_heap_->Protect(parent_address, size, protect)) {
+  if (!parent_heap_->Protect(parent_address, size, protect, old_protect)) {
     XELOGE("PhysicalHeap::Protect failed due to parent heap failure");
     return false;
   }

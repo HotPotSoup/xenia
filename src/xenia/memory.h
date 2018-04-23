@@ -56,6 +56,8 @@ struct HeapAllocationInfo {
   uint32_t allocation_base;
   // The memory protection option when the region was initially allocated.
   uint32_t allocation_protect;
+  // The size specified when the region was initially allocated, in bytes.
+  uint32_t allocation_size;
   // The size of the region beginning at the base address in which all pages
   // have identical attributes, in bytes.
   uint32_t region_size;
@@ -63,8 +65,6 @@ struct HeapAllocationInfo {
   uint32_t state;
   // The access protection of the pages in the region.
   uint32_t protect;
-  // The type of pages in the region (private).
-  uint32_t type;
 };
 
 // Describes a single page in the page table.
@@ -101,6 +101,9 @@ class BaseHeap {
   // Dumps information about all allocations within the heap to the log.
   void DumpMap();
 
+  uint32_t GetTotalPageCount();
+  uint32_t GetUnreservedPageCount();
+
   // Allocates pages with the given properties and allocation strategy.
   // This can reserve and commit the pages as well as set protection modes.
   // This will fail if not enough contiguous pages can be found.
@@ -132,13 +135,17 @@ class BaseHeap {
   virtual bool Release(uint32_t address, uint32_t* out_region_size = nullptr);
 
   // Modifies the protection mode of pages within the given range.
-  virtual bool Protect(uint32_t address, uint32_t size, uint32_t protect);
+  virtual bool Protect(uint32_t address, uint32_t size, uint32_t protect,
+                       uint32_t* old_protect = nullptr);
 
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
+
+  // Queries the base and size of a region containing the given address.
+  bool QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size);
 
   // Queries the current protection mode of the region containing the given
   // address.
@@ -205,7 +212,8 @@ class PhysicalHeap : public BaseHeap {
   bool Decommit(uint32_t address, uint32_t size) override;
   bool Release(uint32_t base_address,
                uint32_t* out_region_size = nullptr) override;
-  bool Protect(uint32_t address, uint32_t size, uint32_t protect) override;
+  bool Protect(uint32_t address, uint32_t size, uint32_t protect,
+               uint32_t* old_protect = nullptr) override;
 
  protected:
   VirtualHeap* parent_heap_;
@@ -303,12 +311,13 @@ class Memory {
   //
   // This has a significant performance penalty for writes in in the range or
   // nearby (sharing 64KiB pages).
-  uintptr_t AddPhysicalWriteWatch(uint32_t physical_address, uint32_t length,
-                                  cpu::WriteWatchCallback callback,
-                                  void* callback_context, void* callback_data);
+  uintptr_t AddPhysicalAccessWatch(uint32_t physical_address, uint32_t length,
+                                   cpu::MMIOHandler::WatchType type,
+                                   cpu::AccessWatchCallback callback,
+                                   void* callback_context, void* callback_data);
 
-  // Cancels a write watch requested with AddPhysicalWriteWatch.
-  void CancelWriteWatch(uintptr_t watch_handle);
+  // Cancels a write watch requested with AddPhysicalAccessWatch.
+  void CancelAccessWatch(uintptr_t watch_handle);
 
   // Allocates virtual memory from the 'system' heap.
   // System memory is kept separate from game memory but is still accessible
@@ -325,6 +334,9 @@ class Memory {
 
   // Gets the heap with the given properties.
   BaseHeap* LookupHeapByType(bool physical, uint32_t page_size);
+
+  // Gets the physical base heap.
+  VirtualHeap* GetPhysicalHeap();
 
   // Dumps a map of all allocated memory to the log.
   void DumpMap();

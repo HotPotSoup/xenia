@@ -8,6 +8,7 @@
  */
 
 #include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
 
 #include <string>
 
@@ -33,7 +34,7 @@ bool CreateFolder(const std::wstring& path) {
 }
 
 bool DeleteFolder(const std::wstring& path) {
-  auto double_null_path = path + L"\0";
+  auto double_null_path = path + std::wstring(L"\0", 1);
   SHFILEOPSTRUCT op = {0};
   op.wFunc = FO_DELETE;
   op.pFrom = double_null_path.c_str();
@@ -89,6 +90,12 @@ class Win32FileHandle : public FileHandle {
       *out_bytes_read = bytes_read;
       return true;
     } else {
+      if (GetLastError() == ERROR_NOACCESS) {
+        XELOGW(
+            "Win32FileHandle::Read(..., %.8llX, %.8llX, ...) returned "
+            "ERROR_NOACCESS. Read-only memory?",
+            buffer, buffer_length);
+      }
       return false;
     }
   }

@@ -43,7 +43,6 @@ const uint32_t XAPC::kDummyRundownRoutine;
 using xe::cpu::ppc::PPCOpcode;
 
 uint32_t next_xthread_id_ = 0;
-thread_local XThread* current_thread_tls_ = nullptr;
 
 XThread::XThread(KernelState* kernel_state)
     : XObject(kernel_state, kTypeThread), guest_thread_(true) {}
@@ -102,13 +101,16 @@ XThread::~XThread() {
   }
 }
 
+thread_local XThread* current_xthread_tls_ = nullptr;
+
+bool XThread::IsInThread() { return Thread::IsInThread(); }
+
 bool XThread::IsInThread(XThread* other) {
-  return current_thread_tls_ == other;
+  return current_xthread_tls_ == other;
 }
-bool XThread::IsInThread() { return current_thread_tls_ != nullptr; }
 
 XThread* XThread::GetCurrentThread() {
-  XThread* thread = current_thread_tls_;
+  XThread* thread = reinterpret_cast<XThread*>(current_xthread_tls_);
   if (!thread) {
     assert_always("Attempting to use kernel stuff from a non-kernel thread");
   }
@@ -142,29 +144,26 @@ void XThread::set_last_error(uint32_t error_code) {
 }
 
 void XThread::set_name(const std::string& name) {
-  name_ = xe::format_string("%s (%.8X)", name.c_str(), handle());
+  thread_name_ = xe::format_string("%s (%.8X)", name.c_str(), handle());
 
   if (thread_) {
     // May be getting set before the thread is created.
     // One the thread is ready it will handle it.
-    thread_->set_name(name_);
+    thread_->set_name(thread_name_);
   }
 }
 
 uint8_t next_cpu = 0;
 uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
   if (!proc_mask) {
-    next_cpu++;
-    if (next_cpu > 6) {
-      next_cpu = 0;
-    }
-
+    next_cpu = (next_cpu + 1) % 6;
     return next_cpu;  // is this reasonable?
   }
   assert_false(proc_mask & 0xC0);
 
   uint8_t cpu_number = 7 - xe::lzcnt(proc_mask);
   assert_true(1 << cpu_number == proc_mask);
+  assert_true(cpu_number < 6);
   return cpu_number;
 }
 
@@ -373,17 +372,19 @@ X_STATUS XThread::Create() {
     xe::threading::set_current_thread_id(handle());
 
     // Set name immediately, if we have one.
-    thread_->set_name(name());
+    thread_->set_name(thread_name_);
 
     // Profiler needs to know about the thread.
-    xe::Profiler::ThreadEnter(name().c_str());
+    xe::Profiler::ThreadEnter(thread_name_.c_str());
 
     // Execute user code.
-    current_thread_tls_ = this;
+    current_xthread_tls_ = this;
+    current_thread_ = this;
     running_ = true;
     Execute();
     running_ = false;
-    current_thread_tls_ = nullptr;
+    current_thread_ = nullptr;
+    current_xthread_tls_ = nullptr;
 
     xe::Profiler::ThreadExit();
 
@@ -396,10 +397,13 @@ X_STATUS XThread::Create() {
     XELOGE("CreateThread failed");
     return X_STATUS_NO_MEMORY;
   }
-  thread_->set_affinity_mask(proc_mask);
+
+  if (!FLAGS_ignore_thread_affinities) {
+    thread_->set_affinity_mask(proc_mask);
+  }
 
   // Set the thread name based on host ID (for easier debugging).
-  if (name_.empty()) {
+  if (thread_name_.empty()) {
     char thread_name[32];
     snprintf(thread_name, xe::countof(thread_name), "XThread%.04X",
              thread_->system_id());
@@ -439,7 +443,8 @@ X_STATUS XThread::Exit(int exit_code) {
   emulator()->processor()->OnThreadExit(thread_id_);
 
   // NOTE: unless PlatformExit fails, expect it to never return!
-  current_thread_tls_ = nullptr;
+  current_xthread_tls_ = nullptr;
+  current_thread_ = nullptr;
   xe::Profiler::ThreadExit();
 
   running_ = false;
@@ -462,15 +467,20 @@ X_STATUS XThread::Terminate(int exit_code) {
   emulator()->processor()->OnThreadExit(thread_id_);
 
   running_ = false;
-  Release();
+  if (XThread::IsInThread(this)) {
+    Release();
+    xe::threading::Thread::Exit(exit_code);
+  } else {
+    thread_->Terminate(exit_code);
+    Release();
+  }
 
-  thread_->Terminate(exit_code);
   return X_STATUS_SUCCESS;
 }
 
 void XThread::Execute() {
   XELOGKERNEL("XThread::Execute thid %d (handle=%.8X, '%s', native=%.8X)",
-              thread_id_, handle(), name_.c_str(), thread_->system_id());
+              thread_id_, handle(), thread_name_.c_str(), thread_->system_id());
 
   // Let the kernel know we are starting.
   kernel_state()->OnThreadExecute(this);
@@ -702,6 +712,7 @@ uint32_t XThread::active_cpu() const {
 }
 
 void XThread::SetActiveCpu(uint32_t cpu_index) {
+  assert_true(cpu_index < 6);
   uint8_t* pcr = memory()->TranslateVirtual(pcr_address_);
   xe::store_and_swap<uint8_t>(pcr + 0x10C, cpu_index);
 }
@@ -849,7 +860,7 @@ bool XThread::Save(ByteStream* stream) {
   }
 
   stream->Write('THRD');
-  stream->Write(name_);
+  stream->Write(thread_name_);
 
   ThreadSavedState state;
   state.thread_id = thread_id_;
@@ -915,7 +926,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
   XELOGD("XThread %.8X", thread->handle());
 
-  thread->name_ = stream->Read<std::string>();
+  thread->thread_name_ = stream->Read<std::string>();
 
   ThreadSavedState state;
   stream->Read(&state, sizeof(ThreadSavedState));
@@ -983,7 +994,8 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
       Clock::SetGuestTickCount(state.tick_count_);
       Clock::SetGuestSystemTime(state.system_time_);
 
-      current_thread_tls_ = thread;
+      current_xthread_tls_ = thread;
+      current_thread_ = thread;
 
       // Acquire any mutants
       for (auto mutant : thread->pending_mutant_acquires_) {
@@ -999,7 +1011,8 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
       uint32_t pc = state.context.pc;
       thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_, pc);
 
-      current_thread_tls_ = nullptr;
+      current_thread_ = nullptr;
+      current_xthread_tls_ = nullptr;
 
       xe::Profiler::ThreadExit();
 
@@ -1027,7 +1040,7 @@ XHostThread::XHostThread(KernelState* kernel_state, uint32_t stack_size,
 void XHostThread::Execute() {
   XELOGKERNEL(
       "XThread::Execute thid %d (handle=%.8X, '%s', native=%.8X, <host>)",
-      thread_id_, handle(), name_.c_str(), thread_->system_id());
+      thread_id_, handle(), thread_name_.c_str(), thread_->system_id());
 
   // Let the kernel know we are starting.
   kernel_state()->OnThreadExecute(this);

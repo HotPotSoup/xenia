@@ -7,13 +7,13 @@
  ******************************************************************************
  */
 
-#include "xenia/xbox.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
@@ -30,22 +30,6 @@ typedef struct {
   xe::be<uint32_t> flags;
 } X_THREADNAME_INFO;
 static_assert_size(X_THREADNAME_INFO, 0x10);
-
-// https://msdn.microsoft.com/en-us/library/windows/desktop/aa363082.aspx
-typedef struct {
-  xe::be<uint32_t> exception_code;
-  xe::be<uint32_t> exception_flags;
-  xe::be<uint32_t> exception_record;
-  xe::be<uint32_t> exception_address;
-  xe::be<uint32_t> number_parameters;
-  xe::be<uint32_t> exception_information[15];
-} X_EXCEPTION_RECORD;
-static_assert_size(X_EXCEPTION_RECORD, 0x50);
-void AppendParam(StringBuffer* string_buffer,
-                 pointer_t<X_EXCEPTION_RECORD> record) {
-  string_buffer->AppendFormat("%.8X(%.8X)", record.guest_address(),
-                              uint32_t(record->exception_code));
-}
 
 void RtlRaiseException(pointer_t<X_EXCEPTION_RECORD> record) {
   if (record->exception_code == 0x406D1388) {

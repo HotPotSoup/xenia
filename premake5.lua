@@ -5,6 +5,14 @@ location(build_root)
 targetdir(build_bin)
 objdir(build_obj)
 
+-- Define an ARCH variable
+-- Only use this to enable architecture-specific functionality.
+if os.is("linux") then
+  ARCH = os.outputof("uname -p")
+else
+  ARCH = "unknown"
+end
+
 includedirs({
   ".",
   "src",
@@ -19,11 +27,17 @@ defines({
   "GLEW_NO_GLU=1",
 })
 
-vectorextensions("AVX")
+-- TODO(DrChat): Find a way to disable this on other architectures.
+if ARCH ~= "ppc64" then
+  filter("architecture:x86_64")
+    vectorextensions("AVX")
+  filter({})
+end
+
+characterset("Unicode")
 flags({
   --"ExtraWarnings",        -- Sets the compiler's maximum warning level.
   "FatalWarnings",        -- Treat warnings as errors.
-  "Unicode",
 })
 
 filter("kind:StaticLib")
@@ -74,12 +88,53 @@ filter("platforms:Linux")
   system("linux")
   toolset("clang")
   buildoptions({
-    "-mlzcnt",  -- Assume lzcnt supported.
+    -- "-mlzcnt",  -- (don't) Assume lzcnt is supported.
+    "`pkg-config --cflags gtk+-x11-3.0`",
+    "-fno-lto", -- Premake doesn't support LTO on clang
+  })
+  links({
+    "pthread",
+    "dl",
+    "lz4",
+    "rt",
+  })
+  linkoptions({
+    "`pkg-config --libs gtk+-3.0`",
   })
 
-filter({"platforms:Linux", "language:C++"})
+filter({"platforms:Linux", "kind:*App"})
+  linkgroups("On")
+
+filter({"platforms:Linux", "language:C++", "toolset:gcc"})
   buildoptions({
     "-std=c++14",
+  })
+  links({
+  })
+
+filter({"platforms:Linux", "toolset:gcc"})
+  if ARCH == "ppc64" then
+    buildoptions({
+      "-m32",
+      "-mpowerpc64"
+    })
+    linkoptions({
+      "-m32",
+      "-mpowerpc64"
+    })
+  end
+
+filter({"platforms:Linux", "language:C++", "toolset:clang"})
+  buildoptions({
+    "-std=c++14",
+    "-stdlib=libstdc++",
+  })
+  links({
+    "c++",
+    "c++abi"
+  })
+  disablewarnings({
+    "deprecated-register"
   })
 
 filter("platforms:Windows")
@@ -93,11 +148,13 @@ filter("platforms:Windows")
     "/wd4127",  -- 'conditional expression is constant'.
     "/wd4324",  -- 'structure was padded due to alignment specifier'.
     "/wd4189",  -- 'local variable is initialized but not referenced'.
+    "/utf-8",   -- 'build correctly on systems with non-Latin codepages'.
   })
   flags({
     "NoMinimalRebuild", -- Required for /MP above.
-    "Symbols",
   })
+
+  symbols("On")
   defines({
     "_CRT_NONSTDC_NO_DEPRECATE",
     "_CRT_SECURE_NO_WARNINGS",
@@ -118,6 +175,7 @@ filter("platforms:Windows")
     "glu32",
     "opengl32",
     "comctl32",
+    "shcore",
     "shlwapi",
   })
 
@@ -165,10 +223,12 @@ solution("xenia")
   include("third_party/capstone.lua")
   include("third_party/gflags.lua")
   include("third_party/glew.lua")
+  include("third_party/glslang-spirv.lua")
   include("third_party/imgui.lua")
   include("third_party/libav.lua")
   include("third_party/snappy.lua")
   include("third_party/spirv-tools.lua")
+  include("third_party/vulkan/loader")
   include("third_party/xxhash.lua")
   include("third_party/yaml-cpp.lua")
 
@@ -181,13 +241,16 @@ solution("xenia")
   include("src/xenia/cpu/backend/x64")
   include("src/xenia/debug/ui")
   include("src/xenia/gpu")
+  include("src/xenia/gpu/null")
   include("src/xenia/gpu/gl4")
+  include("src/xenia/gpu/vulkan")
   include("src/xenia/hid")
   include("src/xenia/hid/nop")
   include("src/xenia/kernel")
   include("src/xenia/ui")
   include("src/xenia/ui/gl")
   include("src/xenia/ui/spirv")
+  include("src/xenia/ui/vulkan")
   include("src/xenia/vfs")
 
   if os.is("windows") then

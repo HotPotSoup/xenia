@@ -45,11 +45,11 @@ enum class AllocationType {
 enum class DeallocationType {
   kRelease = 1 << 0,
   kDecommit = 1 << 1,
-  kDecommitRelease = kRelease | kDecommit,
 };
 
 // Allocates a block of memory at the given page-aligned base address.
 // Fails if the memory is not available.
+// Specify nullptr for base_address to leave it up to the system.
 void* AllocFixed(void* base_address, size_t length,
                  AllocationType allocation_type, PageAccess access);
 
@@ -121,20 +121,17 @@ inline void* low_address(void* address) {
   return reinterpret_cast<void*>(uint64_t(address) & 0xFFFFFFFF);
 }
 
-void copy_and_swap_16_aligned(uint16_t* dest, const uint16_t* src,
-                              size_t count);
-void copy_and_swap_16_unaligned(uint16_t* dest, const uint16_t* src,
-                                size_t count);
-void copy_and_swap_32_aligned(uint32_t* dest, const uint32_t* src,
-                              size_t count);
-void copy_and_swap_32_unaligned(uint32_t* dest, const uint32_t* src,
-                                size_t count);
-void copy_and_swap_64_aligned(uint64_t* dest, const uint64_t* src,
-                              size_t count);
-void copy_and_swap_64_unaligned(uint64_t* dest, const uint64_t* src,
-                                size_t count);
-void copy_and_swap_16_in_32_aligned(uint32_t* dest, const uint32_t* src,
-                                    size_t count);
+void copy_128_aligned(void* dest, const void* src, size_t count);
+
+void copy_and_swap_16_aligned(void* dest, const void* src, size_t count);
+void copy_and_swap_16_unaligned(void* dest, const void* src, size_t count);
+void copy_and_swap_32_aligned(void* dest, const void* src, size_t count);
+void copy_and_swap_32_unaligned(void* dest, const void* src, size_t count);
+void copy_and_swap_64_aligned(void* dest, const void* src, size_t count);
+void copy_and_swap_64_unaligned(void* dest, const void* src, size_t count);
+void copy_and_swap_16_in_32_aligned(void* dest, const void* src, size_t count);
+void copy_and_swap_16_in_32_unaligned(void* dest, const void* src,
+                                      size_t count);
 
 template <typename T>
 void copy_and_swap(T* dest, const T* src, size_t count) {

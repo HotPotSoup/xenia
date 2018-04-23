@@ -22,6 +22,7 @@
 
 // NOTE: must be included last as it expects windows.h to already be included.
 #include "third_party/xbyak/xbyak/xbyak.h"
+#include "third_party/xbyak/xbyak/xbyak_bin2hex.h"
 #include "third_party/xbyak/xbyak/xbyak_util.h"
 
 namespace xe {
@@ -70,10 +71,12 @@ enum XmmConst {
   XMMUnpackFLOAT16_2,
   XMMPackFLOAT16_4,
   XMMUnpackFLOAT16_4,
-  XMMPackSHORT_2Min,
-  XMMPackSHORT_2Max,
+  XMMPackSHORT_Min,
+  XMMPackSHORT_Max,
   XMMPackSHORT_2,
+  XMMPackSHORT_4,
   XMMUnpackSHORT_2,
+  XMMUnpackSHORT_4,
   XMMOneOver255,
   XMMMaskEvenPI16,
   XMMShiftMaskEvenPI16,
@@ -89,6 +92,10 @@ enum XmmConst {
   XMMSignMaskF32,
   XMMShortMinPS,
   XMMShortMaxPS,
+  XMMIntMin,
+  XMMIntMax,
+  XMMIntMaxPD,
+  XMMPosIntMinPS,
 };
 
 // Unfortunately due to the design of xbyak we have to pass this to the ctor.
@@ -114,17 +121,18 @@ class X64Emitter : public Xbyak::CodeGenerator {
   Processor* processor() const { return processor_; }
   X64Backend* backend() const { return backend_; }
 
+  static uintptr_t PlaceConstData();
+  static void FreeConstData(uintptr_t data);
+
   bool Emit(GuestFunction* function, hir::HIRBuilder* builder,
             uint32_t debug_info_flags, FunctionDebugInfo* debug_info,
             void** out_code_address, size_t* out_code_size,
             std::vector<SourceMapEntry>* out_source_map);
 
-  static uint32_t PlaceData(Memory* memory);
-
  public:
   // Reserved:  rsp
   // Scratch:   rax/rcx/rdx
-  //            xmm0-2 (could be only xmm0 with some trickery)
+  //            xmm0-2
   // Available: rbx, r12-r15 (save to get r8-r11, rbp, rsi, rdi?)
   //            xmm6-xmm15 (save to get xmm3-xmm5)
   static const int GPR_COUNT = 5;
@@ -169,8 +177,11 @@ class X64Emitter : public Xbyak::CodeGenerator {
                   uint64_t arg0);
   void CallNativeSafe(void* fn);
   void SetReturnAddress(uint64_t value);
-  void ReloadECX();
-  void ReloadEDX();
+
+  Xbyak::Reg64 GetContextReg();
+  Xbyak::Reg64 GetMembaseReg();
+  void ReloadContext();
+  void ReloadMembase();
 
   void nop(size_t length = 1);
 
